@@ -12,7 +12,7 @@ import onnx
 import os
 import pickle  # Save Data
 import psutil
-from pyglet import font
+from pyglet import font as pfont
 import pyperclip
 import base64
 import queue
@@ -47,18 +47,22 @@ from lib_v5.vr_network.model_param_init import ModelParameters
 from kthread import KThread
 from lib_v5 import spec_utils
 from pathlib  import Path
-from separate import SeperateDemucs, SeperateMDX, SeperateVR, save_format
+from separate import SeperateDemucs, SeperateMDX, SeperateMDXC, SeperateVR, save_format
 from playsound import playsound
 from tkinter import *
 from tkinter.tix import *
 import re
 from typing import List
+import sys
 import ssl
+import yaml
+from ml_collections import ConfigDict
+from collections import Counter
 
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 logging.info('UVR BEGIN')
 
-PREVIOUS_PATCH_WIN = 'UVR_Patch_1_12_23_14_54'
+PREVIOUS_PATCH_WIN = 'UVR_Patch_3_31_23_5_5'
 
 is_dnd_compatible = True
 banner_placement = -2
@@ -161,12 +165,15 @@ VR_MODELS_DIR = os.path.join(MODELS_DIR, 'VR_Models')
 MDX_MODELS_DIR = os.path.join(MODELS_DIR, 'MDX_Net_Models')
 DEMUCS_MODELS_DIR = os.path.join(MODELS_DIR, 'Demucs_Models')
 DEMUCS_NEWER_REPO_DIR = os.path.join(DEMUCS_MODELS_DIR, 'v3_v4_repo')
+MDX_MIXER_PATH = os.path.join(BASE_PATH, 'lib_v5', 'mixer.ckpt')
 
 #Cache & Parameters
 VR_HASH_DIR = os.path.join(VR_MODELS_DIR, 'model_data')
 VR_HASH_JSON = os.path.join(VR_MODELS_DIR, 'model_data', 'model_data.json')
 MDX_HASH_DIR = os.path.join(MDX_MODELS_DIR, 'model_data')
-MDX_HASH_JSON = os.path.join(MDX_MODELS_DIR, 'model_data', 'model_data.json')
+MDX_HASH_JSON = os.path.join(MDX_HASH_DIR, 'model_data.json')
+MDX_C_CONFIG_PATH = os.path.join(MDX_HASH_DIR, 'mdx_c_configs')
+
 DEMUCS_MODEL_NAME_SELECT = os.path.join(DEMUCS_MODELS_DIR, 'model_data', 'model_name_mapper.json')
 MDX_MODEL_NAME_SELECT = os.path.join(MDX_MODELS_DIR, 'model_data', 'model_name_mapper.json')
 ENSEMBLE_CACHE_DIR = os.path.join(BASE_PATH, 'gui_data', 'saved_ensembles')
@@ -247,16 +254,36 @@ class ModelData():
         self.is_normalization = root.is_normalization_var.get()
         self.is_primary_stem_only = root.is_primary_stem_only_var.get()
         self.is_secondary_stem_only = root.is_secondary_stem_only_var.get()
-        self.is_denoise = root.is_denoise_var.get()
-        self.is_mdx_batch_mode = False
-        self.mdx_batch_size = int(root.mdx_batch_size_var.get())
+        self.is_denoise = root.is_denoise_var.get()#
+        self.is_mdx_c_seg_def = root.is_mdx_c_seg_def_var.get()#
+        self.mdx_batch_size = 1 if root.mdx_batch_size_var.get() == DEF_OPT else int(root.mdx_batch_size_var.get())
+        self.mdxnet_stem_select = root.mdxnet_stems_var.get() 
+        self.overlap = float(root.overlap_var.get()) if not root.overlap_var.get() == DEFAULT else 0.25
+        self.overlap_mdx = float(root.overlap_mdx_var.get()) if not root.overlap_mdx_var.get() == DEFAULT else root.overlap_mdx_var.get()
+        self.overlap_mdx23 = int(float(root.overlap_mdx23_var.get()))
+        self.semitone_shift = float(root.semitone_shift_var.get())
+        self.is_pitch_change = False if self.semitone_shift == 0 else True
+        self.is_match_frequency_pitch = root.is_match_frequency_pitch_var.get()
+        self.is_mdx_ckpt = False
+        self.is_mdx_c = False
+        self.is_mdx_combine_stems = root.is_demucs_combine_stems_var.get()
+        self.mdx_c_configs = None
+        self.mdx_model_stems = []
+        self.mdx_dim_f_set = None
+        self.mdx_dim_t_set = None
+        self.mdx_stem_count = 1
+        self.compensate = None
+        self.mdx_n_fft_scale_set = None
         self.wav_type_set = root.wav_type_set
         self.mp3_bit_set = root.mp3_bit_set_var.get()
         self.save_format = root.save_format_var.get()
         self.is_invert_spec = root.is_invert_spec_var.get()
+        self.is_mixer_mode = root.is_mixer_mode_var.get()
         self.demucs_stems = root.demucs_stems_var.get()
+        self.is_demucs_combine_stems = root.is_demucs_combine_stems_var.get()
         self.demucs_source_list = []
         self.demucs_stem_count = 0
+        self.mixer_path = MDX_MIXER_PATH
         self.model_name = model_name
         self.process_method = selected_process_method
         self.model_status = False if self.model_name == CHOOSE_MODEL or self.model_name == NO_MODEL else True
@@ -277,6 +304,8 @@ class ModelData():
         self.is_pre_proc_model = is_pre_proc_model
         self.is_dry_check = is_dry_check
         self.model_samplerate = 44100
+        self.model_capacity = 32, 128
+        self.is_vr_51_model = False
         self.is_demucs_pre_proc_model_inst_mix = False
         self.manual_download_Button = None
         self.secondary_model_4_stem = []
@@ -297,9 +326,19 @@ class ModelData():
             self.model_name = partitioned_name[2]
             self.model_and_process_tag = model_name
             self.ensemble_primary_stem, self.ensemble_secondary_stem = root.return_ensemble_stems()
-            self.is_ensemble_mode = True if not is_secondary_model and not is_pre_proc_model else False
-            self.is_4_stem_ensemble = True if root.ensemble_main_stem_var.get() == FOUR_STEM_ENSEMBLE and self.is_ensemble_mode else False
-            self.pre_proc_model_activated = root.is_demucs_pre_proc_model_activate_var.get() if not self.ensemble_primary_stem == VOCAL_STEM else False
+            self.is_ensemble_mode = (
+                True if not is_secondary_model and not is_pre_proc_model else False
+            )
+            self.is_4_stem_ensemble = (
+                True
+                if root.ensemble_main_stem_var.get() == FOUR_STEM_ENSEMBLE and self.is_ensemble_mode
+                else False
+            )
+            self.pre_proc_model_activated = (
+                root.is_demucs_pre_proc_model_activate_var.get()
+                if not self.ensemble_primary_stem == VOCAL_STEM
+                else False
+            )
 
         if self.process_method == VR_ARCH_TYPE:
             self.is_secondary_model_activated = root.vr_is_secondary_model_activate_var.get() if not self.is_secondary_model else False
@@ -307,39 +346,65 @@ class ModelData():
             self.is_tta = root.is_tta_var.get()
             self.is_post_process = root.is_post_process_var.get()
             self.window_size = int(root.window_size_var.get())
-            self.batch_size = int(root.batch_size_var.get())
+            self.batch_size = 1 if root.batch_size_var.get() == DEF_OPT else int(root.batch_size_var.get())
             self.crop_size = int(root.crop_size_var.get())
             self.is_high_end_process = 'mirroring' if root.is_high_end_process_var.get() else 'None'
             self.post_process_threshold = float(root.post_process_threshold_var.get())
+            self.model_capacity = 32, 128
             self.model_path = os.path.join(VR_MODELS_DIR, f"{self.model_name}.pth")
             self.get_model_hash()
             if self.model_hash:
-                self.model_data = self.get_model_data(VR_HASH_DIR, root.vr_hash_MAPPER)
+                self.model_data = self.get_model_data(VR_HASH_DIR, root.vr_hash_MAPPER) if not self.model_hash == WOOD_INST_MODEL_HASH else WOOD_INST_PARAMS
                 if self.model_data:
                     vr_model_param = os.path.join(VR_PARAM_DIR, "{}.json".format(self.model_data["vr_model_param"]))
                     self.primary_stem = self.model_data["primary_stem"]
-                    self.secondary_stem = STEM_PAIR_MAPPER[self.primary_stem]
+                    self.secondary_stem = secondary_stem(self.primary_stem)
                     self.vr_model_param = ModelParameters(vr_model_param)
                     self.model_samplerate = self.vr_model_param.param['sr']
+                    if "nout" in self.model_data.keys() and "nout_lstm" in self.model_data.keys():
+                        self.model_capacity = self.model_data["nout"], self.model_data["nout_lstm"]
+                        self.is_vr_51_model = True
                 else:
                     self.model_status = False
                 
         if self.process_method == MDX_ARCH_TYPE:
             self.is_secondary_model_activated = root.mdx_is_secondary_model_activate_var.get() if not is_secondary_model else False
             self.margin = int(root.margin_var.get())
-            self.chunks = root.determine_auto_chunks(root.chunks_var.get(), self.is_gpu_conversion)
-            self.is_mdx_batch_mode = True if root.chunks_var.get() == BATCH_MODE else False
+            self.chunks = root.determine_auto_chunks(root.chunks_var.get(), self.is_gpu_conversion) if root.is_chunk_mdxnet_var.get() else 0
+            self.mdx_window_size = int(root.mdx_window_size_var.get())
             self.get_mdx_model_path()
             self.get_model_hash()
             if self.model_hash:
                 self.model_data = self.get_model_data(MDX_HASH_DIR, root.mdx_hash_MAPPER)
                 if self.model_data:
-                    self.compensate = self.model_data["compensate"] if root.compensate_var.get() == AUTO_SELECT else float(root.compensate_var.get())
-                    self.mdx_dim_f_set = self.model_data["mdx_dim_f_set"]
-                    self.mdx_dim_t_set = self.model_data["mdx_dim_t_set"]
-                    self.mdx_n_fft_scale_set = self.model_data["mdx_n_fft_scale_set"]
-                    self.primary_stem = self.model_data["primary_stem"]
-                    self.secondary_stem = STEM_PAIR_MAPPER[self.primary_stem]
+                    if "config_yaml" in self.model_data:
+                        self.is_mdx_c = True
+                        config_path = os.path.join(MDX_C_CONFIG_PATH, self.model_data["config_yaml"])
+                        #print(config_path)
+                        if os.path.isfile(config_path):
+                            with open(config_path) as f:
+                                config = ConfigDict(yaml.load(f, Loader=yaml.FullLoader))
+
+                            self.mdx_c_configs = config
+                            
+                            if self.mdx_c_configs.training.target_instrument:
+                                self.mdx_model_stems = [self.mdx_c_configs.training.target_instrument] 
+                                self.primary_stem = self.mdx_c_configs.training.target_instrument
+                            else:
+                                self.mdx_model_stems = self.mdx_c_configs.training.instruments
+                                self.primary_stem = PRIMARY_STEM if self.is_ensemble_mode else self.mdxnet_stem_select
+                                self.mdxnet_stem_select = self.ensemble_primary_stem if self.is_ensemble_mode else self.mdxnet_stem_select
+                                self.mdx_stem_count = len(self.mdx_model_stems)
+                        else:
+                            self.model_status = False
+                    else:
+                        self.compensate = self.model_data["compensate"] if root.compensate_var.get() == AUTO_SELECT else float(root.compensate_var.get())
+                        self.mdx_dim_f_set = self.model_data["mdx_dim_f_set"]
+                        self.mdx_dim_t_set = self.model_data["mdx_dim_t_set"]
+                        self.mdx_n_fft_scale_set = self.model_data["mdx_n_fft_scale_set"]
+                        self.primary_stem = self.model_data["primary_stem"]
+                        
+                    self.secondary_stem = secondary_stem(self.primary_stem)
                 else:
                     self.model_status = False
 
@@ -347,14 +412,12 @@ class ModelData():
             self.is_secondary_model_activated = root.demucs_is_secondary_model_activate_var.get() if not is_secondary_model else False
             if not self.is_ensemble_mode:
                 self.pre_proc_model_activated = root.is_demucs_pre_proc_model_activate_var.get() if not root.demucs_stems_var.get() in [VOCAL_STEM, INST_STEM] else False
-            self.overlap = float(root.overlap_var.get())
             self.margin_demucs = int(root.margin_demucs_var.get())
             self.chunks_demucs = root.determine_auto_chunks(root.chunks_demucs_var.get(), self.is_gpu_conversion)
             self.shifts = int(root.shifts_var.get())
             self.is_split_mode = root.is_split_mode_var.get()
             self.segment = root.segment_var.get()
             self.is_chunk_demucs = root.is_chunk_demucs_var.get()
-            self.is_demucs_combine_stems = root.is_demucs_combine_stems_var.get()
             self.is_primary_stem_only = root.is_primary_stem_only_var.get() if self.is_ensemble_mode else root.is_primary_stem_only_Demucs_var.get() 
             self.is_secondary_stem_only = root.is_secondary_stem_only_var.get() if self.is_ensemble_mode else root.is_secondary_stem_only_Demucs_var.get()
             self.get_demucs_model_path()
@@ -378,7 +441,7 @@ class ModelData():
                 self.demucs_4_stem_added_count = self.demucs_4_stem_added_count - 1 if self.is_secondary_model_activated else self.demucs_4_stem_added_count
                 if self.is_secondary_model_activated:
                     self.secondary_model_4_stem_model_names_list = [None if i is None else i.model_basename for i in self.secondary_model_4_stem]
-                    self.is_demucs_4_stem_secondaries = True 
+                    self.is_demucs_4_stem_secondaries = True
             else:
                 primary_stem = self.ensemble_primary_stem if self.is_ensemble_mode and self.process_method == DEMUCS_ARCH_TYPE else self.primary_stem
                 self.secondary_model_data(primary_stem)
@@ -399,12 +462,19 @@ class ModelData():
               
     def get_mdx_model_path(self):
         
+        if self.model_name.endswith(CKPT):
+            # self.chunks = 0
+            # self.is_mdx_batch_mode = True
+            self.is_mdx_ckpt = True
+            
+        ext = '' if self.is_mdx_ckpt else ONNX
+        
         for file_name, chosen_mdx_model in root.mdx_name_select_MAPPER.items():
             if self.model_name in chosen_mdx_model:
-                self.model_path = os.path.join(MDX_MODELS_DIR, f"{file_name}.onnx")
+                self.model_path = os.path.join(MDX_MODELS_DIR, f"{file_name}{ext}")
                 break
         else:
-            self.model_path = os.path.join(MDX_MODELS_DIR, f"{self.model_name}.onnx")
+            self.model_path = os.path.join(MDX_MODELS_DIR, f"{self.model_name}{ext}")
             
         self.mixer_path = os.path.join(MDX_MODELS_DIR, f"mixer_val.ckpt")
     
@@ -434,7 +504,7 @@ class ModelData():
         
         if not self.is_ensemble_mode:
             self.primary_stem = PRIMARY_STEM if self.demucs_stems == ALL_STEMS else self.demucs_stems
-            self.secondary_stem = STEM_PAIR_MAPPER[self.primary_stem]
+            self.secondary_stem = secondary_stem(self.primary_stem)
 
     def get_model_data(self, model_hash_dir, hash_mapper):
 
@@ -482,12 +552,17 @@ class ModelData():
                         break
                     
             if not self.model_hash:
-                with open(self.model_path, 'rb') as f:
-                    f.seek(- 10000 * 1024, 2)
-                    self.model_hash = hashlib.md5(f.read()).hexdigest()
-                
+                try:
+                    with open(self.model_path, 'rb') as f:
+                        f.seek(- 10000 * 1024, 2)
+                        self.model_hash = hashlib.md5(f.read()).hexdigest()
+                except:
+                    self.model_hash = hashlib.md5(open(self.model_path,'rb').read()).hexdigest()
+                    
                 table_entry = {self.model_path: self.model_hash}
                 model_hash_table.update(table_entry)
+                
+        #print(self.model_hash)
 
 class Ensembler():
     def __init__(self, is_manual_ensemble=False):
@@ -552,10 +627,8 @@ class Ensembler():
         
         if is_bulk:
             number_list = list(set([os.path.basename(i).split("_")[0] for i in audio_inputs]))
-            print(number_list)
             for n in number_list:
                 current_list = [i for i in audio_inputs if os.path.basename(i).startswith(n)]
-                print(current_list)
                 audio_file_base = os.path.basename(current_list[0]).split('.wav')[0]
                 stem_testing = "instrum" if "Instrumental" in audio_file_base else "vocals"
                 if is_mv_sep:
@@ -598,12 +671,14 @@ class AudioTools():
         spec_utils.align_audio(audio_inputs[0], audio_inputs[1], aligned_path, inverted_path, self.wav_type_set, self.is_normalization, command_Text, root.progress_bar_main_var, self.save_format)
         
     def pitch_or_time_shift(self, audio_file, audio_file_base):
-        
+        is_time_correction = True
         rate = float(root.time_stretch_rate_var.get()) if self.audio_tool == TIME_STRETCH else float(root.pitch_rate_var.get())
         is_pitch = False if self.audio_tool == TIME_STRETCH else True
+        if is_pitch:
+            is_time_correction = True if root.is_time_correction_var.get() else False
         file_text = TIME_TEXT if self.audio_tool == TIME_STRETCH else PITCH_TEXT
         save_path = os.path.join(self.main_export_path, f"{self.is_testing_audio}{audio_file_base}{file_text}.wav")
-        spec_utils.augment_audio(save_path, audio_file, rate, self.is_normalization, self.wav_type_set, self.save_format, is_pitch=is_pitch)
+        spec_utils.augment_audio(save_path, audio_file, rate, self.is_normalization, self.wav_type_set, self.save_format, is_pitch=is_pitch, is_time_correction=is_time_correction)
         
 class ToolTip(object):
 
@@ -615,6 +690,7 @@ class ToolTip(object):
 
     def showtip(self, text):
         "Display text in tooltip window"
+        
         self.text = text
         if self.tipwindow or not self.text:
             return
@@ -625,7 +701,7 @@ class ToolTip(object):
         tw.wm_overrideredirect(1)
         tw.wm_geometry("+%d+%d" % (x, y))
         label = Label(tw, text=self.text, justify=LEFT,
-                      background="#151515", foreground="#dedede", highlightcolor="#898b8e", relief=SOLID, borderwidth=1,
+                      background="#333333", foreground="#ffffff", highlightcolor="#898b8e", relief=SOLID, borderwidth=1,
                       font=(MAIN_FONT_NAME, f"{FONT_SIZE_1}", "normal"))#('Century Gothic', FONT_SIZE_4)
         label.pack(ipadx=1)
 
@@ -798,6 +874,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.ensemble_type_var = tk.StringVar(value=MAX_MIN)
         self.save_current_settings_var = tk.StringVar(value=SELECT_SAVED_SET)
         self.demucs_stems_var = tk.StringVar(value=ALL_STEMS)
+        self.mdxnet_stems_var = tk.StringVar(value=ALL_STEMS)
         self.is_primary_stem_only_Text_var = tk.StringVar(value='')
         self.is_secondary_stem_only_Text_var = tk.StringVar(value='')
         self.is_primary_stem_only_Demucs_Text_var = tk.StringVar(value='')
@@ -869,7 +946,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.active_download_thread = None
 
         # Font
-        font.add_file(FONT_PATH)
+        pfont.add_file(FONT_PATH)
         self.font = tk.font.Font(family=MAIN_FONT_NAME, size=FONT_SIZE_F1)
         self.font_smaller = tk.font.Font(family=MAIN_FONT_NAME, size=FONT_SIZE_F2)
         self.fontRadio = tk.font.Font(family=MAIN_FONT_NAME, size=FONT_SIZE_F3) 
@@ -907,68 +984,61 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
     
     def check_is_open_menu_advanced_vr_options(self):
         try:
-            if not self.is_open_menu_advanced_vr_options.get():
-                self.menu_advanced_vr_options() 
-            else:
+            if self.is_open_menu_advanced_vr_options.get():
                 self.menu_advanced_vr_options_close_window()
-                self.menu_advanced_vr_options()
+                
+            self.menu_advanced_vr_options()
         except Exception as e:
             self.error_log_var.set("{}".format(error_text('VR Menu', e)))
 
     def check_is_open_menu_advanced_demucs_options(self): 
         try:
-            if not self.is_open_menu_advanced_demucs_options.get():
-                self.menu_advanced_demucs_options() 
-            else:
+            if self.is_open_menu_advanced_demucs_options.get():
                 self.menu_advanced_demucs_options_close_window()
-                self.menu_advanced_demucs_options()
+                
+            self.menu_advanced_demucs_options()
         except Exception as e:
             self.error_log_var.set("{}".format(error_text('Demucs Menu', e)))
   
     def check_is_open_menu_advanced_mdx_options(self): 
         try:
-            if not self.is_open_menu_advanced_mdx_options.get():
-                self.menu_advanced_mdx_options() 
-            else:
+            if self.is_open_menu_advanced_mdx_options.get():
                 self.menu_advanced_mdx_options_close_window()
-                self.menu_advanced_mdx_options()
+                
+            self.menu_advanced_mdx_options()
         except Exception as e:
             self.error_log_var.set("{}".format(error_text('MDX-Net Menu', e)))
 
     def check_is_open_menu_advanced_ensemble_options(self): 
         try:
-            if not self.is_open_menu_advanced_ensemble_options.get():
-                self.menu_advanced_ensemble_options() 
-            else:
+            if self.is_open_menu_advanced_ensemble_options.get():
                 self.menu_advanced_ensemble_options_close_window()
-                self.menu_advanced_ensemble_options()
+                
+            self.menu_advanced_ensemble_options()
         except Exception as e:
             self.error_log_var.set("{}".format(error_text('Ensemble Menu', e)))
 
     def check_is_open_menu_help(self): 
-        if not self.is_open_menu_help.get():
-            self.menu_help() 
-        else:
+        if self.is_open_menu_help.get():
             self.menu_help_close_window()
-            self.menu_help()
+            
+        self.menu_help()
 
     def check_is_open_menu_error_log(self): 
-        if not self.is_open_menu_error_log.get():
-            self.menu_error_log() 
-        else:
+        if self.is_open_menu_error_log.get():
             self.menu_error_log_close_window()
-            self.menu_error_log()
+            
+        self.menu_error_log()
             
     def check_is_open_menu_view_inputs(self): 
         try:
-            if not self.is_open_menu_view_inputs.get():
-                self.menu_view_inputs() 
-            else:
+            if self.is_open_menu_view_inputs.get():
                 self.menu_view_inputs_close_window()
-                self.menu_view_inputs()
+                
+            self.menu_view_inputs()
         except Exception as e:
             self.error_log_var.set("{}".format(error_text('Inputs Menu', e)))
- 
+
     #Ensemble Listbox Functions
     def ensemble_listbox_get_all_selected_models(self):return [self.ensemble_listbox_Option.get(i) for i in self.ensemble_listbox_Option.curselection()]
     def ensemble_listbox_select_from_indexs(self, indexes):return [self.ensemble_listbox_Option.selection_set(i) for i in indexes]
@@ -1009,7 +1079,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         if network == MDX_ARCH_TYPE:
             dir = MDX_HASH_DIR     
         
-        [os.remove(os.path.join(dir, x)) for x in os.listdir(dir) if x not in ['model_data.json', 'model_name_mapper.json']]
+        [os.remove(os.path.join(dir, x)) for x in os.listdir(dir) if x not in ['model_data.json', 'model_name_mapper.json'] or not os.path.isdir(os.path.join(dir, x))]
         self.vr_model_var.set(CHOOSE_MODEL)
         self.mdx_net_model_var.set(CHOOSE_MODEL)
         self.model_data_table.clear()
@@ -1141,23 +1211,39 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.mdx_net_model_Label_place = lambda:self.mdx_net_model_Label.place(x=0, y=LOW_MENU_Y[0], width=LEFT_ROW_WIDTH, height=LABEL_HEIGHT, relx=0, rely=6/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL1_ROWS)
         self.mdx_net_model_Option = ttk.OptionMenu(self.options_Frame, self.mdx_net_model_var)
         self.mdx_net_model_Option_place = lambda:self.mdx_net_model_Option.place(x=0, y=LOW_MENU_Y[1], width=LEFT_ROW_WIDTH, height=OPTION_HEIGHT, relx=0, rely=7/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL1_ROWS)
+        self.mdx_net_model_var.trace_add('write', lambda *args: self.update_main_widget_states())
         self.help_hints(self.mdx_net_model_Label, text=CHOOSE_MODEL_HELP)
 
-        # MDX-chunks
-        self.chunks_Label = self.main_window_LABEL_SET(self.options_Frame, CHUNKS_MDX_MAIN_LABEL)
-        self.chunks_Label_place = lambda:self.chunks_Label.place(x=MAIN_ROW_X[0], y=MAIN_ROW_Y[0], width=0, height=LABEL_HEIGHT, relx=1/3, rely=2/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
-        self.chunks_Option = ttk.Combobox(self.options_Frame, value=CHUNKS, textvariable=self.chunks_var)
-        self.chunks_Option_place = lambda:self.chunks_Option.place(x=MAIN_ROW_X[1], y=MAIN_ROW_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=3/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
-        self.combobox_entry_validation(self.chunks_Option, self.chunks_var, REG_CHUNKS, CHUNKS)
-        self.help_hints(self.chunks_Label, text=CHUNKS_HELP)
-
-        # MDX-Margin
-        self.margin_Label = self.main_window_LABEL_SET(self.options_Frame, MARGIN_MDX_MAIN_LABEL)
-        self.margin_Label_place = lambda:self.margin_Label.place(x=MAIN_ROW_2_X[0], y=MAIN_ROW_2_Y[0], width=0, height=LABEL_HEIGHT, relx=2/3, rely=2/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
-        self.margin_Option = ttk.Combobox(self.options_Frame, value=MARGIN_SIZE, textvariable=self.margin_var)
-        self.margin_Option_place = lambda:self.margin_Option.place(x=MAIN_ROW_2_X[1], y=MAIN_ROW_2_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=2/3, rely=3/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
-        self.combobox_entry_validation(self.margin_Option, self.margin_var, REG_MARGIN, MARGIN_SIZE)
-        self.help_hints(self.margin_Label, text=MARGIN_HELP)
+        # MDX-Batches
+        self.mdx_batch_size_Label = self.main_window_LABEL_SET(self.options_Frame, BATCHES_MDX_MAIN_LABEL)
+        self.mdx_batch_size_Label_place = lambda:self.mdx_batch_size_Label.place(x=MAIN_ROW_2_X[0], y=MAIN_ROW_2_Y[0], width=0, height=LABEL_HEIGHT, relx=2/3, rely=2/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.mdx_batch_size_Option = ttk.Combobox(self.options_Frame, value=BATCH_SIZE, width=MENU_COMBOBOX_WIDTH, textvariable=self.mdx_batch_size_var)
+        self.mdx_batch_size_Option_place = lambda:self.mdx_batch_size_Option.place(x=MAIN_ROW_2_X[1], y=MAIN_ROW_2_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=2/3, rely=3/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.combobox_entry_validation(self.mdx_batch_size_Option, self.mdx_batch_size_var, REG_BATCHES, BATCH_SIZE)
+        self.help_hints(self.mdx_batch_size_Label, text=BATCH_SIZE_HELP)
+        
+        # MDX-Overlap
+        self.overlap_mdx_Label = self.main_window_LABEL_SET(self.options_Frame, 'OVERLAP')
+        self.overlap_mdx_Label_place = lambda:self.overlap_mdx_Label.place(x=MAIN_ROW_2_X[0], y=MAIN_ROW_2_Y[0], width=0, height=LABEL_HEIGHT, relx=2/3, rely=2/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.overlap_mdx_Option = ttk.Combobox(self.options_Frame, value=MDX_OVERLAP, width=MENU_COMBOBOX_WIDTH, textvariable=self.overlap_mdx_var)
+        self.overlap_mdx_Option_place = lambda:self.overlap_mdx_Option.place(x=MAIN_ROW_2_X[1], y=MAIN_ROW_2_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=2/3, rely=3/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.combobox_entry_validation(self.overlap_mdx_Option, self.overlap_mdx_var, REG_OVERLAP, MDX_OVERLAP)
+        self.help_hints(self.overlap_mdx_Label, text=OVERLAP_HELP)
+        
+        # Choose MDX-Net Stems
+        self.mdxnet_stems_Label = self.main_window_LABEL_SET(self.options_Frame, CHOOSE_STEMS_MAIN_LABEL)
+        self.mdxnet_stems_Label_place = lambda:self.mdxnet_stems_Label.place(x=MAIN_ROW_X[0], y=MAIN_ROW_Y[0], width=0, height=LABEL_HEIGHT, relx=1/3, rely=2/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.mdxnet_stems_Option = ttk.OptionMenu(self.options_Frame, self.mdxnet_stems_var, None)
+        self.mdxnet_stems_Option_place = lambda:self.mdxnet_stems_Option.place(x=MAIN_ROW_X[1], y=MAIN_ROW_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=3/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.help_hints(self.mdxnet_stems_Label, text=DEMUCS_STEMS_HELP)
+        
+        # MDX-Volume Compensation
+        self.compensate_Label = self.main_window_LABEL_SET(self.options_Frame, VOL_COMP_MDX_MAIN_LABEL)
+        self.compensate_Label_place = lambda:self.compensate_Label.place(x=MAIN_ROW_X[0], y=MAIN_ROW_Y[0], width=0, height=LABEL_HEIGHT, relx=1/3, rely=2/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.compensate_Option = ttk.Combobox(self.options_Frame, value=VOL_COMPENSATION, width=MENU_COMBOBOX_WIDTH, textvariable=self.compensate_var)
+        self.compensate_Option_place = lambda:self.compensate_Option.place(x=MAIN_ROW_X[1], y=MAIN_ROW_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=3/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.combobox_entry_validation(self.compensate_Option, self.compensate_var, REG_COMPENSATION, VOL_COMPENSATION)
+        self.help_hints(self.compensate_Label, text=COMPENSATE_HELP)
 
         ### VR ARCH ###
         
@@ -1194,7 +1280,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.help_hints(self.demucs_model_Label, text=CHOOSE_MODEL_HELP)
 
         # Choose Demucs Stems
-        self.demucs_stems_Label = self.main_window_LABEL_SET(self.options_Frame, CHOOSE_DEMUCS_STEMS_MAIN_LABEL)
+        self.demucs_stems_Label = self.main_window_LABEL_SET(self.options_Frame, CHOOSE_STEMS_MAIN_LABEL)
         self.demucs_stems_Label_place = lambda:self.demucs_stems_Label.place(x=MAIN_ROW_X[0], y=MAIN_ROW_Y[0], width=0, height=LABEL_HEIGHT, relx=1/3, rely=2/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
         self.demucs_stems_Option = ttk.OptionMenu(self.options_Frame, self.demucs_stems_var, None)
         self.demucs_stems_Option_place = lambda:self.demucs_stems_Option.place(x=MAIN_ROW_X[1], y=MAIN_ROW_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=3/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
@@ -1244,7 +1330,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.ensemble_type_Option_place = lambda:self.ensemble_type_Option.place(x=MAIN_ROW_2_X[1], y=MAIN_ROW_2_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT,relx=2/3, rely=3/11, relwidth=1/3, relheight=1/self.COL1_ROWS)
         self.help_hints(self.ensemble_type_Label, text=ENSEMBLE_TYPE_HELP)
         
-         # Select Music Files Option
+        # Select Music Files Option
     
         # Ensemble Save Ensemble Outputs
         
@@ -1290,6 +1376,11 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.pitch_rate_Option_place = lambda:self.pitch_rate_Option.place(x=MAIN_ROW_X[1], y=MAIN_ROW_Y[1], width=MAIN_ROW_WIDTH, height=OPTION_HEIGHT, relx=1/3, rely=3/self.COL1_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
         self.combobox_entry_validation(self.pitch_rate_Option, self.pitch_rate_var, REG_PITCH, TIME_PITCH)
 
+        # Is Time Correction
+        self.is_time_correction_Option = ttk.Checkbutton(master=self.options_Frame, text='Time Correction', variable=self.is_time_correction_var)
+        self.is_time_correction_Option_place = lambda:self.is_time_correction_Option.place(x=CHECK_BOX_X, y=CHECK_BOX_Y, width=CHECK_BOX_WIDTH, height=CHECK_BOX_HEIGHT, relx=1/3, rely=5/self.COL2_ROWS, relwidth=1/3, relheight=1/self.COL2_ROWS)
+        self.help_hints(self.is_time_correction_Option, text=IS_TIME_CORRECTION_HELP)
+        
         ### SHARED SETTINGS ###
         
         # GPU Selection
@@ -1331,10 +1422,14 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.segment_Option,
         self.mdx_net_model_Label,
         self.mdx_net_model_Option,
-        self.chunks_Label,
-        self.chunks_Option,
-        self.margin_Label,
-        self.margin_Option,
+        self.mdx_batch_size_Label,
+        self.mdx_batch_size_Option,
+        self.overlap_mdx_Label,
+        self.overlap_mdx_Option,
+        self.mdxnet_stems_Label,
+        self.mdxnet_stems_Option,
+        self.compensate_Label,
+        self.compensate_Option,
         self.chosen_ensemble_Label,
         self.chosen_ensemble_Option,
         self.save_current_settings_Label,
@@ -1360,23 +1455,26 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.is_secondary_stem_only_Option,
         self.is_primary_stem_only_Demucs_Option,
         self.is_secondary_stem_only_Demucs_Option,
-        self.model_sample_mode_Option)
+        self.model_sample_mode_Option,
+        self.is_time_correction_Option)
         
         REFRESH_VARS = (self.mdx_net_model_var,
                         self.vr_model_var,
                         self.demucs_model_var,
-                        self.demucs_stems_var,
+                        # self.demucs_stems_var,
+                        # self.mdxnet_stems_var,
                         self.is_chunk_demucs_var,
-                        self.is_primary_stem_only_Demucs_var,
-                        self.is_secondary_stem_only_Demucs_var,
-                        self.is_primary_stem_only_var,
-                        self.is_secondary_stem_only_var,
+                        self.is_chunk_mdxnet_var,
+                        # self.is_primary_stem_only_Demucs_var,
+                        # self.is_secondary_stem_only_Demucs_var,
+                        # self.is_primary_stem_only_var,
+                        # self.is_secondary_stem_only_var,
                         self.model_download_demucs_var,
                         self.model_download_mdx_var,
                         self.model_download_vr_var,
                         self.select_download_var,
-                        self.is_primary_stem_only_Demucs_Text_var,
-                        self.is_secondary_stem_only_Demucs_Text_var,
+                        # self.is_primary_stem_only_Demucs_Text_var,
+                        # self.is_secondary_stem_only_Demucs_Text_var,
                         self.chosen_process_method_var,
                         self.ensemble_main_stem_var)
         
@@ -1386,8 +1484,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
     
     def combobox_entry_validation(self, combobox: ttk.Combobox, var: tk.StringVar, pattern, default):
         """Verifies valid input for comboboxes"""
-        
-        validation = lambda value:False if re.fullmatch(pattern, value) is None else True
+
+        validation = lambda value:False if re.fullmatch(pattern, value) is None else True        
         invalid = lambda:(var.set(default[0]))
         combobox.config(validate='focus', validatecommand=(self.register(validation), '%P'), invalidcommand=(self.register(invalid),))
 
@@ -1514,16 +1612,22 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         except Exception as e:
             self.error_log_var.set(error_text('Temp File Deletion', e))
         
-    def get_files_from_dir(self, directory, ext):
+    def get_files_from_dir(self, directory, ext, is_mdxnet=False):
         """Gets files from specified directory that ends with specified extention"""
 
-        return tuple(os.path.splitext(x)[0] for x in os.listdir(directory) if x.endswith(ext))
+        #ext = '.onnx' if is_mdxnet else ext
+
+        return tuple(x if is_mdxnet and x.endswith(CKPT) else os.path.splitext(x)[0] for x in os.listdir(directory) if x.endswith(ext))
         
     def determine_auto_chunks(self, chunks, gpu):
         """Determines appropriate chunk size based on user computer specs"""
         
         if OPERATING_SYSTEM == 'Darwin':
             gpu = -1
+
+        if chunks == BATCH_MODE:
+            chunks = 0
+            #self.chunks_var.set(AUTO_SELECT)
 
         if chunks == 'Full':
             chunk_set = 0
@@ -1547,8 +1651,6 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                 if sys_mem >= int(17):
                     chunk_set = int(60) 
         elif chunks == '0':
-            chunk_set = 0
-        elif chunks == BATCH_MODE:
             chunk_set = 0
         else:
             chunk_set = int(chunks)
@@ -1582,16 +1684,19 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                                   message=message[1],
                                   parent=root) 
       
-    def model_list(self, primary_stem: str, secondary_stem: str, is_4_stem_check=False, is_dry_check=False, is_no_demucs=False):
+    def model_list(self, primary_stem: str, secondary_stem: str, is_4_stem_check=False, is_multi_stem=False, is_dry_check=False, is_no_demucs=False):
         stem_check = self.assemble_model_data(arch_type=ENSEMBLE_STEM_CHECK, is_dry_check=is_dry_check)
         
+        if is_multi_stem:
+            return [model.model_and_process_tag for model in stem_check]
+        
         if is_no_demucs:
-            return [model.model_and_process_tag for model in stem_check if model.primary_stem == primary_stem or model.primary_stem == secondary_stem]
+            return [model.model_and_process_tag for model in stem_check if model.primary_stem == primary_stem or model.primary_stem == secondary_stem or primary_stem in model.mdx_model_stems]
         else:
             if is_4_stem_check:
-                return [model.model_and_process_tag for model in stem_check if model.demucs_stem_count == 4]
+                return [model.model_and_process_tag for model in stem_check if model.demucs_stem_count == 4 or model.mdx_stem_count == 4]
             else:
-                return [model.model_and_process_tag for model in stem_check if model.primary_stem == primary_stem or model.primary_stem == secondary_stem or primary_stem.lower() in model.demucs_source_list]
+                return [model.model_and_process_tag for model in stem_check if model.primary_stem == primary_stem or model.primary_stem == secondary_stem or primary_stem.lower() in model.demucs_source_list or primary_stem in model.mdx_model_stems]
       
     def help_hints(self, widget, text):
         toolTip = ToolTip(widget)
@@ -1664,7 +1769,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         
         return model, sources
   
-    def cached_source_model_list_check(self, model_list: list[ModelData]):
+    def cached_source_model_list_check(self, model_list: List[ModelData]):
 
         model: ModelData
         primary_model_names = lambda process_method:[model.model_basename if model.process_method == process_method else None for model in model_list]
@@ -1853,7 +1958,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
 
     #--Secondary Window Methods--
 
-    def menu_placement(self, window: Toplevel, title, pop_up=False, is_help_hints=False, close_function=None):
+    def menu_placement(self, window: Toplevel, title, pop_up=False, is_help_hints=False, close_function=None, stem_combobox=None):
         """Prepares and centers each secondary window relative to the main window"""
         
         window.wm_attributes('-alpha', 0.0) if not is_windows else None
@@ -1864,18 +1969,16 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         window.iconbitmap(ICON_IMG_PATH if is_windows else None)
         window.update()
         window.deiconify()
-
+        
         root_location_x = root.winfo_x()
         root_location_y = root.winfo_y()
-        
         root_x = root.winfo_width() 
         root_y = root.winfo_height()
-
         sub_menu_x = window.winfo_width() 
         sub_menu_y = window.winfo_height()
-
         menu_offset_x = (root_x - sub_menu_x) // 2
         menu_offset_y = (root_y - sub_menu_y) // 2
+        
         window.geometry("+%d+%d" %(root_location_x+menu_offset_x, root_location_y+menu_offset_y))
         window.wm_attributes('-alpha', 1.0) if not is_windows else None
         
@@ -1896,12 +1999,34 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         if close_function:
             window.bind(right_click_button, lambda e:right_click_menu(e))
             
+        if type(stem_combobox) is ttk.Combobox:
+            window.bind('<Configure>', lambda e:window.geometry("+%d+%d" %(root_location_x+menu_offset_x, root_location_y+menu_offset_y)))
+            stem_combobox.focus_set()
+            
         if pop_up:
             window.attributes('-topmost', 'true') if OPERATING_SYSTEM == "Linux" else None
             window.grab_set()
             root.wait_window(window)
         
-    def menu_tab_control(self, toplevel, ai_network_vars, is_demucs=False):
+    def menu_move_tab(notebook: ttk.Notebook, tab_text, new_position):
+        # Get the tab ID
+        tab_id = None
+        for tab in notebook.tabs():
+            if notebook.tab(tab, "text") == tab_text:
+                tab_id = tab
+                break
+
+        if tab_id is None:
+            print(f"No tab named '{tab_text}'")
+            return
+
+        # remove the tab
+        notebook.forget(tab_id)
+        
+        # add it back in new position
+        notebook.insert(new_position, tab_id)
+        
+    def menu_tab_control(self, toplevel, ai_network_vars, is_demucs=False, is_mdxnet=False):
         """Prepares the tabs setup for some windows"""
         
         tabControl = ttk.Notebook(toplevel)
@@ -1920,11 +2045,13 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         tab2.grid_rowconfigure(0, weight=1)
         tab2.grid_columnconfigure(0, weight=1)
         
+        
+        #if not is_mdxnet:
         self.menu_secondary_model(tab2, ai_network_vars)
         
-        if is_demucs:
+        if is_demucs or is_mdxnet:
             tab3 = ttk.Frame(tabControl)
-            tabControl.add(tab3, text ='Pre-process Model')
+            tabControl.add(tab3, text='Pre-process Model' if is_demucs else 'MDXNET23 Only Options')
             tab3.grid_rowconfigure(0, weight=1)
             tab3.grid_columnconfigure(0, weight=1)
             
@@ -2055,7 +2182,6 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                 input_files_listbox_Option.configure(state=tk.NORMAL)
                 return
             
-            #print(list_to_string(self.inputPaths))
             audio_input_total()
             
         def verify_audio_start_thread(is_create_samples=False):
@@ -2181,159 +2307,162 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             
         #Settings Tab 1
         settings_menu_main_Frame = self.menu_FRAME_SET(tab1)
-        settings_menu_main_Frame.grid(row=0,column=0,padx=0,pady=0)  
+        settings_menu_main_Frame.grid()  
         settings_title_Label = self.menu_title_LABEL_SET(settings_menu_main_Frame, "General Menu")
-        settings_title_Label.grid(row=0,column=0,padx=0,pady=15)
+        settings_title_Label.grid(pady=15)
         
         select_Label = self.menu_sub_LABEL_SET(settings_menu_main_Frame, 'Additional Menus & Information')
-        select_Label.grid(row=1,column=0,padx=0,pady=5)
+        select_Label.grid(pady=5)
         
         select_Option = ttk.OptionMenu(settings_menu_main_Frame, self.main_menu_var, None, *OPTION_LIST.keys(), command=lambda selection:(OPTION_LIST[selection](), close_window()))
-        select_Option.grid(row=2,column=0,padx=0,pady=5)
+        select_Option.grid(pady=5)
         
         help_hints_Option = ttk.Checkbutton(settings_menu_main_Frame, text='Enable Help Hints', variable=self.help_hints_var, width=HELP_HINT_CHECKBOX_WIDTH) 
-        help_hints_Option.grid(row=3,column=0,padx=0,pady=5)
+        help_hints_Option.grid(pady=0)
         
         open_app_dir_Button = ttk.Button(settings_menu_main_Frame, text='Open Application Directory', command=lambda:OPEN_FILE_func(BASE_PATH))
-        open_app_dir_Button.grid(row=6,column=0,padx=0,pady=5)
+        open_app_dir_Button.grid(pady=5)
         
         reset_all_app_settings_Button = ttk.Button(settings_menu_main_Frame, text='Reset All Settings to Default', command=lambda:self.load_to_default_confirm())
-        reset_all_app_settings_Button.grid(row=7,column=0,padx=0,pady=5)
+        reset_all_app_settings_Button.grid(pady=5)
         
         if is_windows:
             restart_app_Button = ttk.Button(settings_menu_main_Frame, text='Restart Application', command=lambda:self.restart())
-            restart_app_Button.grid(row=8,column=0,padx=0,pady=5)
+            restart_app_Button.grid(pady=5)
         
         close_settings_win_Button = ttk.Button(settings_menu_main_Frame, text='Close Window', command=lambda:close_window())
-        close_settings_win_Button.grid(row=9,column=0,padx=0,pady=5)
+        close_settings_win_Button.grid(pady=5)
 
         app_update_Label = self.menu_title_LABEL_SET(settings_menu_main_Frame, "Application Updates")
-        app_update_Label.grid(row=10,column=0,padx=0,pady=15)
+        app_update_Label.grid(pady=15)
         
-        self.app_update_button = ttk.Button(settings_menu_main_Frame, textvariable=self.app_update_button_Text_var, command=lambda:self.pop_up_update_confirmation())
-        self.app_update_button.grid(row=11,column=0,padx=0,pady=5)
+        auto_update_model_params_Option = ttk.Checkbutton(settings_menu_main_Frame, text='Auto Update Params', variable=self.is_auto_update_model_params_var, width=20) 
+        auto_update_model_params_Option.grid(pady=0)
+        
+        self.app_update_button = ttk.Button(settings_menu_main_Frame, textvariable=self.app_update_button_Text_var, width=22, command=lambda:self.pop_up_update_confirmation())
+        self.app_update_button.grid(pady=5)
         
         self.app_update_status_Label = tk.Label(settings_menu_main_Frame, textvariable=self.app_update_status_Text_var, font=(MAIN_FONT_NAME,  f"{FONT_SIZE_5}"), width=35, justify="center", relief="ridge", fg="#13849f")
-        self.app_update_status_Label.grid(row=12,column=0,padx=0,pady=20)
+        self.app_update_status_Label.grid(pady=20)
         
         donate_Button = ttk.Button(settings_menu_main_Frame, image=self.donate_img, command=lambda:webbrowser.open_new_tab(DONATE_LINK_BMAC))
-        donate_Button.grid(row=13,column=0,padx=0,pady=5)
+        donate_Button.grid(pady=5)
         self.help_hints(donate_Button, text=DONATE_HELP)
         
         #Settings Tab 2
         settings_menu_format_Frame = self.menu_FRAME_SET(tab2)
-        settings_menu_format_Frame.grid(row=0,column=0,padx=0,pady=0)  
+        settings_menu_format_Frame.grid()  
         
         audio_format_title_Label = self.menu_title_LABEL_SET(settings_menu_format_Frame, "Audio Format Settings", width=20)
-        audio_format_title_Label.grid(row=0,column=0,padx=0,pady=10)
+        audio_format_title_Label.grid(pady=10)
         
         self.wav_type_set_Label = self.menu_sub_LABEL_SET(settings_menu_format_Frame, 'Wav Type')
-        self.wav_type_set_Label.grid(row=1,column=0,padx=0,pady=5)
+        self.wav_type_set_Label.grid(pady=5)
         
         self.wav_type_set_Option = ttk.OptionMenu(settings_menu_format_Frame, self.wav_type_set_var, None, *WAV_TYPE)
-        self.wav_type_set_Option.grid(row=2,column=0,padx=20,pady=5)
+        self.wav_type_set_Option.grid(padx=20,pady=5)
         
         self.mp3_bit_set_Label = self.menu_sub_LABEL_SET(settings_menu_format_Frame, 'Mp3 Bitrate')
-        self.mp3_bit_set_Label.grid(row=3,column=0,padx=0,pady=5)
+        self.mp3_bit_set_Label.grid(pady=5)
         
         self.mp3_bit_set_Option = ttk.OptionMenu(settings_menu_format_Frame, self.mp3_bit_set_var, None, *MP3_BIT_RATES)
-        self.mp3_bit_set_Option.grid(row=4,column=0,padx=20,pady=5)
+        self.mp3_bit_set_Option.grid(padx=20,pady=5)
         
         audio_format_title_Label = self.menu_title_LABEL_SET(settings_menu_format_Frame, "General Process Settings")
-        audio_format_title_Label.grid(row=5,column=0,padx=0,pady=10)
+        audio_format_title_Label.grid(pady=10)
         
         self.is_testing_audio_Option = ttk.Checkbutton(settings_menu_format_Frame, text='Settings Test Mode', width=GEN_SETTINGS_WIDTH, variable=self.is_testing_audio_var) 
-        self.is_testing_audio_Option.grid(row=7,column=0,padx=0,pady=0)
+        self.is_testing_audio_Option.grid()
         self.help_hints(self.is_testing_audio_Option, text=IS_TESTING_AUDIO_HELP)
         
         self.is_add_model_name_Option = ttk.Checkbutton(settings_menu_format_Frame, text='Model Test Mode', width=GEN_SETTINGS_WIDTH, variable=self.is_add_model_name_var) 
-        self.is_add_model_name_Option.grid(row=8,column=0,padx=0,pady=0)
+        self.is_add_model_name_Option.grid()
         self.help_hints(self.is_add_model_name_Option, text=IS_MODEL_TESTING_AUDIO_HELP)
         
         self.is_create_model_folder_Option = ttk.Checkbutton(settings_menu_format_Frame, text='Generate Model Folders', width=GEN_SETTINGS_WIDTH, variable=self.is_create_model_folder_var) 
-        self.is_create_model_folder_Option.grid(row=9,column=0,padx=0,pady=0)
+        self.is_create_model_folder_Option.grid()
         self.help_hints(self.is_create_model_folder_Option, text=IS_CREATE_MODEL_FOLDER_HELP)
         
         self.is_accept_any_input_Option = ttk.Checkbutton(settings_menu_format_Frame, text='Accept Any Input', width=GEN_SETTINGS_WIDTH, variable=self.is_accept_any_input_var) 
-        self.is_accept_any_input_Option.grid(row=10,column=0,padx=0,pady=0)
+        self.is_accept_any_input_Option.grid()
         self.help_hints(self.is_accept_any_input_Option, text=IS_ACCEPT_ANY_INPUT_HELP)
         
         self.is_task_complete_Option = ttk.Checkbutton(settings_menu_format_Frame, text='Notification Chimes', width=GEN_SETTINGS_WIDTH, variable=self.is_task_complete_var) 
-        self.is_task_complete_Option.grid(row=11,column=0,padx=0,pady=0)
+        self.is_task_complete_Option.grid()
         self.help_hints(self.is_task_complete_Option, text=IS_TASK_COMPLETE_HELP)
         
         is_normalization_Option = ttk.Checkbutton(settings_menu_format_Frame, text='Normalize Output', width=GEN_SETTINGS_WIDTH, variable=self.is_normalization_var) 
-        is_normalization_Option.grid(row=12,column=0,padx=0,pady=0)
+        is_normalization_Option.grid()
         self.help_hints(is_normalization_Option, text=IS_NORMALIZATION_HELP)
         
         model_sample_mode_Label = self.menu_title_LABEL_SET(settings_menu_format_Frame, "Model Sample Mode Settings")
-        model_sample_mode_Label.grid(row=13,column=0,padx=0,pady=10)
+        model_sample_mode_Label.grid(pady=10)
         
         self.model_sample_mode_duration_Label = self.menu_sub_LABEL_SET(settings_menu_format_Frame, 'Sample Clip Duration')
-        self.model_sample_mode_duration_Label.grid(row=14,column=0,padx=0,pady=5)
+        self.model_sample_mode_duration_Label.grid(pady=5)
         
-        tk.Label(settings_menu_format_Frame, textvariable=model_sample_mode_duration_label_var, font=(MAIN_FONT_NAME, f"{FONT_SIZE_1}"), foreground='#13849f').grid(row=15,column=0,padx=0,pady=2)
+        tk.Label(settings_menu_format_Frame, textvariable=model_sample_mode_duration_label_var, font=(MAIN_FONT_NAME, f"{FONT_SIZE_1}"), foreground='#13849f').grid(pady=2)
         model_sample_mode_duration_Option = ttk.Scale(settings_menu_format_Frame, variable=self.model_sample_mode_duration_var, from_=5, to=120, command=set_vars_for_sample_mode, orient='horizontal')
-        model_sample_mode_duration_Option.grid(row=16,column=0,padx=0,pady=2)
+        model_sample_mode_duration_Option.grid(pady=2)
         
         delete_your_settings_Label = self.menu_title_LABEL_SET(settings_menu_format_Frame, "Delete User Saved Setting")
-        delete_your_settings_Label.grid(row=17,column=0,padx=0,pady=10)
+        delete_your_settings_Label.grid(pady=10)
         self.help_hints(delete_your_settings_Label, text=DELETE_YOUR_SETTINGS_HELP)
         
         delete_your_settings_Option = ttk.OptionMenu(settings_menu_format_Frame, option_var)
-        delete_your_settings_Option.grid(row=18,column=0,padx=20,pady=5)
+        delete_your_settings_Option.grid(padx=20,pady=5)
         self.deletion_list_fill(delete_your_settings_Option, option_var, self.last_found_settings, SETTINGS_CACHE_DIR, SELECT_SAVED_SETTING)
         
         #Settings Tab 3
         settings_menu_download_center_Frame = self.menu_FRAME_SET(tab3)
-        settings_menu_download_center_Frame.grid(row=0,column=0,padx=0,pady=0)  
+        settings_menu_download_center_Frame.grid()  
         
         download_center_title_Label = self.menu_title_LABEL_SET(settings_menu_download_center_Frame, "Application Download Center")
-        download_center_title_Label.grid(row=0,column=0,padx=20,pady=10)
+        download_center_title_Label.grid(padx=20,pady=10)
 
         select_download_Label = self.menu_sub_LABEL_SET(settings_menu_download_center_Frame, "Select Download")
-        select_download_Label.grid(row=1,column=0,padx=0,pady=10)
+        select_download_Label.grid(pady=10)
         
         self.model_download_vr_Button = ttk.Radiobutton(settings_menu_download_center_Frame, text='VR Arch', width=8, variable=self.select_download_var, value='VR Arc', command=lambda:self.download_list_state())
-        self.model_download_vr_Button.grid(row=3,column=0,padx=0,pady=5)
+        self.model_download_vr_Button.grid(pady=5)
         self.model_download_vr_Option = ttk.OptionMenu(settings_menu_download_center_Frame, self.model_download_vr_var)
-        self.model_download_vr_Option.grid(row=4,column=0,padx=0,pady=5)
+        self.model_download_vr_Option.grid(pady=5)
         
         self.model_download_mdx_Button = ttk.Radiobutton(settings_menu_download_center_Frame, text='MDX-Net', width=8, variable=self.select_download_var, value='MDX-Net', command=lambda:self.download_list_state())
-        self.model_download_mdx_Button.grid(row=5,column=0,padx=0,pady=5)
+        self.model_download_mdx_Button.grid(pady=5)
         self.model_download_mdx_Option = ttk.OptionMenu(settings_menu_download_center_Frame, self.model_download_mdx_var)
-        self.model_download_mdx_Option.grid(row=6,column=0,padx=0,pady=5)
+        self.model_download_mdx_Option.grid(pady=5)
 
         self.model_download_demucs_Button = ttk.Radiobutton(settings_menu_download_center_Frame, text='Demucs', width=8, variable=self.select_download_var, value='Demucs', command=lambda:self.download_list_state())
-        self.model_download_demucs_Button.grid(row=7,column=0,padx=0,pady=5)
+        self.model_download_demucs_Button.grid(pady=5)
         self.model_download_demucs_Option = ttk.OptionMenu(settings_menu_download_center_Frame, self.model_download_demucs_var)
-        self.model_download_demucs_Option.grid(row=8,column=0,padx=0,pady=5)
+        self.model_download_demucs_Option.grid(pady=5)
         
         self.download_Button = ttk.Button(settings_menu_download_center_Frame, image=self.download_img, command=lambda:self.download_item())#, command=download_model)
-        self.download_Button.grid(row=9,column=0,padx=0,pady=5)
+        self.download_Button.grid(pady=5)
         
         self.download_progress_info_Label = tk.Label(settings_menu_download_center_Frame, textvariable=self.download_progress_info_var, font=(MAIN_FONT_NAME, f"{FONT_SIZE_2}"), foreground='#13849f', borderwidth=0)
-        self.download_progress_info_Label.grid(row=10,column=0,padx=0,pady=5)
+        self.download_progress_info_Label.grid(pady=5)
         
         self.download_progress_percent_Label = tk.Label(settings_menu_download_center_Frame, textvariable=self.download_progress_percent_var, font=(MAIN_FONT_NAME, f"{FONT_SIZE_2}"), wraplength=350, foreground='#13849f')
-        self.download_progress_percent_Label.grid(row=11,column=0,padx=0,pady=5)
+        self.download_progress_percent_Label.grid(pady=5)
         
         self.download_progress_bar_Progressbar = ttk.Progressbar(settings_menu_download_center_Frame, variable=self.download_progress_bar_var)
-        self.download_progress_bar_Progressbar.grid(row=12,column=0,padx=0,pady=5)
+        self.download_progress_bar_Progressbar.grid(pady=5)
         
         self.stop_download_Button = ttk.Button(settings_menu_download_center_Frame, textvariable=self.download_stop_var, width=15, command=lambda:self.download_post_action(DOWNLOAD_STOPPED))
-        self.stop_download_Button.grid(row=13,column=0,padx=0,pady=5)
+        self.stop_download_Button.grid(pady=5)
         self.stop_download_Button_DISABLE = lambda:(self.download_stop_var.set(""), self.stop_download_Button.configure(state=tk.DISABLED))
         self.stop_download_Button_ENABLE = lambda:(self.download_stop_var.set("Stop Download"), self.stop_download_Button.configure(state=tk.NORMAL))
 
         self.refresh_list_Button = ttk.Button(settings_menu_download_center_Frame, text='Refresh List', command=lambda:(self.online_data_refresh(refresh_list_Button=True), self.download_list_state()))#, command=refresh_list)
-        self.refresh_list_Button.grid(row=14,column=0,padx=0,pady=5)
+        self.refresh_list_Button.grid(pady=5)
         
         self.download_key_Button = ttk.Button(settings_menu_download_center_Frame, image=self.key_img, command=lambda:self.pop_up_user_code_input())
-        self.download_key_Button.grid(row=15,column=0,padx=0,pady=5)
+        self.download_key_Button.grid(pady=5)
                             
         self.manual_download_Button = ttk.Button(settings_menu_download_center_Frame, text='Try Manual Download', command=self.menu_manual_downloads)
-        self.manual_download_Button.grid(row=16,column=0,padx=0,pady=5)
+        self.manual_download_Button.grid(pady=5)
 
         self.download_center_Buttons = (self.model_download_vr_Button,
                                         self.model_download_mdx_Button,
@@ -2346,8 +2475,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                                self.model_download_demucs_Option)
         
         self.download_list_vars = (self.model_download_vr_var,
-                              self.model_download_mdx_var,
-                              self.model_download_demucs_var)
+                                   self.model_download_mdx_var,
+                                   self.model_download_demucs_var)
         
         self.online_data_refresh()
         self.download_list_state()
@@ -2368,6 +2497,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.is_menu_settings_open = False
             settings_menu.destroy()
 
+        #self.update_checkbox_text()
         settings_menu.protocol("WM_DELETE_WINDOW", close_window)
 
     def menu_advanced_vr_options(self):
@@ -2384,75 +2514,64 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         toggle_post_process = lambda:self.post_process_threshold_Option.configure(state=tk.NORMAL) if self.is_post_process_var.get() else self.post_process_threshold_Option.configure(state=tk.DISABLED)
         
         vr_opt_frame = self.menu_FRAME_SET(tab1)
-        vr_opt_frame.grid(row=0,column=0,padx=0,pady=0)  
+        vr_opt_frame.grid()  
         
         vr_title = self.menu_title_LABEL_SET(vr_opt_frame, "Advanced VR Options")
-        vr_title.grid(row=0,column=0,padx=0,pady=10)
+        vr_title.grid(pady=10)
   
         if not self.chosen_process_method_var.get() == VR_ARCH_PM:
             window_size_Label = self.menu_sub_LABEL_SET(vr_opt_frame, 'Window Size')
-            window_size_Label.grid(row=1,column=0,padx=0,pady=5)
+            window_size_Label.grid(pady=5)
             window_size_Option = ttk.Combobox(vr_opt_frame, value=VR_WINDOW, width=MENU_COMBOBOX_WIDTH, textvariable=self.window_size_var)
-            window_size_Option.grid(row=2,column=0,padx=0,pady=5)
+            window_size_Option.grid(pady=5)
             self.combobox_entry_validation(window_size_Option, self.window_size_var, REG_WINDOW, VR_WINDOW)
             self.help_hints(window_size_Label, text=WINDOW_SIZE_HELP)
             
             aggression_setting_Label = self.menu_sub_LABEL_SET(vr_opt_frame, 'Aggression Setting')
-            aggression_setting_Label.grid(row=3,column=0,padx=0,pady=5)
-            aggression_setting_Option = ttk.Combobox(vr_opt_frame, value=VR_BATCH, width=MENU_COMBOBOX_WIDTH, textvariable=self.aggression_setting_var)
-            aggression_setting_Option.grid(row=4,column=0,padx=0,pady=5)
-            self.combobox_entry_validation(aggression_setting_Option, self.aggression_setting_var, REG_WINDOW, VR_BATCH)
+            aggression_setting_Label.grid(pady=5)
+            aggression_setting_Option = ttk.Combobox(vr_opt_frame, value=VR_AGGRESSION, width=MENU_COMBOBOX_WIDTH, textvariable=self.aggression_setting_var)
+            aggression_setting_Option.grid(pady=5)
+            self.combobox_entry_validation(aggression_setting_Option, self.aggression_setting_var, REG_WINDOW, ['10'])
             self.help_hints(aggression_setting_Label, text=AGGRESSION_SETTING_HELP)
         
-        self.crop_size_Label = self.menu_sub_LABEL_SET(vr_opt_frame, 'Crop Size')
-        self.crop_size_Label.grid(row=5,column=0,padx=0,pady=5)
-        self.crop_size_sub_Label = self.menu_sub_LABEL_SET(vr_opt_frame, '(Works with select models only)', font_size=FONT_SIZE_1)
-        self.crop_size_sub_Label.grid(row=6,column=0,padx=0,pady=0)
-        self.crop_size_Option = ttk.Combobox(vr_opt_frame, value=VR_CROP, width=MENU_COMBOBOX_WIDTH, textvariable=self.crop_size_var)
-        self.crop_size_Option.grid(row=7,column=0,padx=0,pady=5)
-        self.combobox_entry_validation(self.crop_size_Option, self.crop_size_var, REG_WINDOW, VR_CROP)
-        self.help_hints(self.crop_size_Label, text=CROP_SIZE_HELP)
-        
         self.batch_size_Label = self.menu_sub_LABEL_SET(vr_opt_frame, 'Batch Size')
-        self.batch_size_Label.grid(row=8,column=0,padx=0,pady=5)
-        self.batch_size_sub_Label = self.menu_sub_LABEL_SET(vr_opt_frame, '(Works with select models only)', font_size=FONT_SIZE_1)
-        self.batch_size_sub_Label.grid(row=9,column=0,padx=0,pady=0)
-        self.batch_size_Option = ttk.Combobox(vr_opt_frame, value=VR_BATCH, width=MENU_COMBOBOX_WIDTH, textvariable=self.batch_size_var)
-        self.batch_size_Option.grid(row=10,column=0,padx=0,pady=5)
-        self.combobox_entry_validation(self.batch_size_Option, self.batch_size_var, REG_WINDOW, VR_BATCH)
+        self.batch_size_Label.grid(pady=5)
+        self.batch_size_Option = ttk.Combobox(vr_opt_frame, value=BATCH_SIZE, width=MENU_COMBOBOX_WIDTH, textvariable=self.batch_size_var)
+        self.batch_size_Option.grid(pady=5)
+        self.combobox_entry_validation(self.batch_size_Option, self.batch_size_var, REG_BATCHES, BATCH_SIZE)
         self.help_hints(self.batch_size_Label, text=BATCH_SIZE_HELP)
         
         self.post_process_threshold_Label = self.menu_sub_LABEL_SET(vr_opt_frame, 'Post-process Threshold')
-        self.post_process_threshold_Label.grid(row=11,column=0,padx=0,pady=5)
+        self.post_process_threshold_Label.grid(pady=5)
         self.post_process_threshold_Option = ttk.Combobox(vr_opt_frame, value=POST_PROCESSES_THREASHOLD_VALUES, width=MENU_COMBOBOX_WIDTH, textvariable=self.post_process_threshold_var)
-        self.post_process_threshold_Option.grid(row=12,column=0,padx=0,pady=5)
+        self.post_process_threshold_Option.grid(pady=5)
         self.combobox_entry_validation(self.post_process_threshold_Option, self.post_process_threshold_var, REG_THES_POSTPORCESS, POST_PROCESSES_THREASHOLD_VALUES)
         self.help_hints(self.post_process_threshold_Label, text=POST_PROCESS_THREASHOLD_HELP)
         
         self.is_tta_Option = ttk.Checkbutton(vr_opt_frame, text='Enable TTA', width=VR_CHECKBOXS_WIDTH, variable=self.is_tta_var) 
-        self.is_tta_Option.grid(row=13,column=0,padx=0,pady=0)
+        self.is_tta_Option.grid(pady=0)
         self.help_hints(self.is_tta_Option, text=IS_TTA_HELP)
         
         self.is_post_process_Option = ttk.Checkbutton(vr_opt_frame, text='Post-Process', width=VR_CHECKBOXS_WIDTH, variable=self.is_post_process_var, command=toggle_post_process) 
-        self.is_post_process_Option.grid(row=14,column=0,padx=0,pady=0)
+        self.is_post_process_Option.grid(pady=0)
         self.help_hints(self.is_post_process_Option, text=IS_POST_PROCESS_HELP)
         
         self.is_high_end_process_Option = ttk.Checkbutton(vr_opt_frame, text='High-End Process', width=VR_CHECKBOXS_WIDTH, variable=self.is_high_end_process_var) 
-        self.is_high_end_process_Option.grid(row=15,column=0,padx=0,pady=0)
+        self.is_high_end_process_Option.grid(pady=0)
         self.help_hints(self.is_high_end_process_Option, text=IS_HIGH_END_PROCESS_HELP)
         
         self.vr_clear_cache_Button = ttk.Button(vr_opt_frame, text='Clear Auto-Set Cache', command=lambda:self.clear_cache(VR_ARCH_TYPE))
-        self.vr_clear_cache_Button.grid(row=16,column=0,padx=0,pady=5)
+        self.vr_clear_cache_Button.grid(pady=5)
         self.help_hints(self.vr_clear_cache_Button, text=CLEAR_CACHE_HELP)
         
         self.open_vr_model_dir_Button = ttk.Button(vr_opt_frame, text='Open VR Models Folder', command=lambda:OPEN_FILE_func(VR_MODELS_DIR))
-        self.open_vr_model_dir_Button.grid(row=17,column=0,padx=0,pady=5)
+        self.open_vr_model_dir_Button.grid(pady=5)
         
         self.vr_return_Button=ttk.Button(vr_opt_frame, text=BACK_TO_MAIN_MENU, command=lambda:(self.menu_advanced_vr_options_close_window(), self.check_is_menu_settings_open()))
-        self.vr_return_Button.grid(row=18,column=0,padx=0,pady=5)
+        self.vr_return_Button.grid(pady=5)
 
         self.vr_close_Button = ttk.Button(vr_opt_frame, text='Close Window', command=lambda:self.menu_advanced_vr_options_close_window())
-        self.vr_close_Button.grid(row=19,column=0,padx=0,pady=5)
+        self.vr_close_Button.grid(pady=5)
         
         toggle_post_process()
         
@@ -2471,13 +2590,13 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         tab1, tab3 = self.menu_tab_control(demuc_opt, self.demucs_secondary_model_vars, is_demucs=True)
         
         demucs_frame = self.menu_FRAME_SET(tab1)
-        demucs_frame.grid(row=0,column=0,padx=0,pady=0)  
+        demucs_frame.grid()  
         
         demucs_pre_model_frame = self.menu_FRAME_SET(tab3)
-        demucs_pre_model_frame.grid(row=0,column=0,padx=0,pady=0)  
+        demucs_pre_model_frame.grid()  
         
         demucs_title_Label = self.menu_title_LABEL_SET(demucs_frame, "Advanced Demucs Options")
-        demucs_title_Label.grid(row=0,column=0,padx=0,pady=10)
+        demucs_title_Label.grid(pady=10)
         
         enable_chunks = lambda:(self.margin_demucs_Option.configure(state=tk.NORMAL), self.chunks_demucs_Option.configure(state=tk.NORMAL))
         disable_chunks = lambda:(self.margin_demucs_Option.configure(state=tk.DISABLED), self.chunks_demucs_Option.configure(state=tk.DISABLED))
@@ -2488,80 +2607,91 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         
         if not self.chosen_process_method_var.get() == DEMUCS_ARCH_TYPE:
             segment_Label = self.menu_sub_LABEL_SET(demucs_frame, 'Segments')
-            segment_Label.grid(row=1,column=0,padx=0,pady=10)
+            segment_Label.grid(pady=10)
             segment_Option = ttk.Combobox(demucs_frame, value=DEMUCS_SEGMENTS, width=MENU_COMBOBOX_WIDTH, textvariable=self.segment_var)
-            segment_Option.grid(row=2,column=0,padx=0,pady=0)
+            segment_Option.grid()
             self.combobox_entry_validation(segment_Option, self.segment_var, REG_SEGMENTS, DEMUCS_SEGMENTS)
             self.help_hints(segment_Label, text=SEGMENT_HELP)
         
         self.shifts_Label = self.menu_sub_LABEL_SET(demucs_frame, 'Shifts')
-        self.shifts_Label.grid(row=3,column=0,padx=0,pady=5)
+        self.shifts_Label.grid(pady=5)
         self.shifts_Option = ttk.Combobox(demucs_frame, value=DEMUCS_SHIFTS, width=MENU_COMBOBOX_WIDTH, textvariable=self.shifts_var)
-        self.shifts_Option.grid(row=4,column=0,padx=0,pady=5)
+        self.shifts_Option.grid(pady=5)
         self.combobox_entry_validation(self.shifts_Option, self.shifts_var, REG_SHIFTS, DEMUCS_SHIFTS)
         self.help_hints(self.shifts_Label, text=SHIFTS_HELP)
 
         self.overlap_Label = self.menu_sub_LABEL_SET(demucs_frame, 'Overlap')
-        self.overlap_Label.grid(row=5,column=0,padx=0,pady=5)
+        self.overlap_Label.grid(pady=5)
         self.overlap_Option = ttk.Combobox(demucs_frame, value=DEMUCS_OVERLAP, width=MENU_COMBOBOX_WIDTH, textvariable=self.overlap_var)
-        self.overlap_Option.grid(row=6,column=0,padx=0,pady=5)
+        self.overlap_Option.grid(pady=5)
         self.combobox_entry_validation(self.overlap_Option, self.overlap_var, REG_OVERLAP, DEMUCS_OVERLAP)
         self.help_hints(self.overlap_Label, text=OVERLAP_HELP)
 
+        pitch_shift_Label = self.menu_sub_LABEL_SET(demucs_frame, 'Shift Conversion Pitch')
+        pitch_shift_Label.grid(pady=5)
+        pitch_shift_Option = ttk.Combobox(demucs_frame, value=SEMITONE_SEL, width=MENU_COMBOBOX_WIDTH, textvariable=self.semitone_shift_var)
+        pitch_shift_Option.grid(pady=5)
+        self.combobox_entry_validation(pitch_shift_Option, self.semitone_shift_var, REG_SEMITONES, SEMI_DEF)
+        self.help_hints(pitch_shift_Label, text=PITCH_SHIFT_HELP)
+
         self.chunks_demucs_Label = self.menu_sub_LABEL_SET(demucs_frame, 'Chunks')
-        self.chunks_demucs_Label.grid(row=7,column=0,padx=0,pady=5)
-        self.chunks_demucs_Option = ttk.Combobox(demucs_frame, value=CHUNKS_DEMUCS, width=MENU_COMBOBOX_WIDTH, textvariable=self.chunks_demucs_var)
-        self.chunks_demucs_Option.grid(row=8,column=0,padx=0,pady=5)
-        self.combobox_entry_validation(self.chunks_demucs_Option, self.chunks_demucs_var, REG_CHUNKS_DEMUCS, CHUNKS_DEMUCS)
+        #self.chunks_demucs_Label.grid(pady=5)
+        self.chunks_demucs_Option = ttk.Combobox(demucs_frame, value=CHUNKS, width=MENU_COMBOBOX_WIDTH, textvariable=self.chunks_demucs_var)
+        #self.chunks_demucs_Option.grid(pady=5)
+        self.combobox_entry_validation(self.chunks_demucs_Option, self.chunks_demucs_var, REG_CHUNKS_DEMUCS, CHUNKS)
         self.help_hints(self.chunks_demucs_Label, text=CHUNKS_DEMUCS_HELP)
         
         self.margin_demucs_Label = self.menu_sub_LABEL_SET(demucs_frame, 'Chunk Margin')
-        self.margin_demucs_Label.grid(row=9,column=0,padx=0,pady=5)
+        #self.margin_demucs_Label.grid(pady=5)
         self.margin_demucs_Option = ttk.Combobox(demucs_frame, value=MARGIN_SIZE, width=MENU_COMBOBOX_WIDTH, textvariable=self.margin_demucs_var)
-        self.margin_demucs_Option.grid(row=10,column=0,padx=0,pady=5)
-        self.combobox_entry_validation(self.margin_Option, self.margin_demucs_var, REG_MARGIN, MARGIN_SIZE)
+        #self.margin_demucs_Option.grid(pady=5)
+        self.combobox_entry_validation(self.margin_demucs_Option, self.margin_demucs_var, REG_MARGIN, MARGIN_SIZE)
         self.help_hints(self.margin_demucs_Label, text=MARGIN_HELP)
         
         self.is_chunk_demucs_Option = ttk.Checkbutton(demucs_frame, text='Enable Chunks', width=DEMUCS_CHECKBOXS_WIDTH, variable=self.is_chunk_demucs_var, command=chunks_toggle) 
-        self.is_chunk_demucs_Option.grid(row=11,column=0,padx=0,pady=0)
+        #self.is_chunk_demucs_Option.grid()
         self.help_hints(self.is_chunk_demucs_Option, text=IS_CHUNK_DEMUCS_HELP)
         
         self.is_split_mode_Option = ttk.Checkbutton(demucs_frame, text='Split Mode', width=DEMUCS_CHECKBOXS_WIDTH, variable=self.is_split_mode_var) 
-        self.is_split_mode_Option.grid(row=12,column=0,padx=0,pady=0)
+        self.is_split_mode_Option.grid()
         self.help_hints(self.is_split_mode_Option, text=IS_SPLIT_MODE_HELP)
         
         self.is_demucs_combine_stems_Option = ttk.Checkbutton(demucs_frame, text='Combine Stems', width=DEMUCS_CHECKBOXS_WIDTH, variable=self.is_demucs_combine_stems_var) 
-        self.is_demucs_combine_stems_Option.grid(row=13,column=0,padx=0,pady=0)
+        self.is_demucs_combine_stems_Option.grid()
         self.help_hints(self.is_demucs_combine_stems_Option, text=IS_DEMUCS_COMBINE_STEMS_HELP)
         
         is_invert_spec_Option = ttk.Checkbutton(demucs_frame, text='Spectral Inversion', width=DEMUCS_CHECKBOXS_WIDTH, variable=self.is_invert_spec_var) 
-        is_invert_spec_Option.grid(row=14,column=0,padx=0,pady=0)
+        is_invert_spec_Option.grid()
         self.help_hints(is_invert_spec_Option, text=IS_INVERT_SPEC_HELP)
         
+        is_mixer_mode_Option = ttk.Checkbutton(demucs_frame, text='Mixer Mode', width=DEMUCS_CHECKBOXS_WIDTH, variable=self.is_mixer_mode_var) 
+        is_mixer_mode_Option.grid()
+        self.help_hints(is_mixer_mode_Option, text=IS_MIXER_MODE_HELP)
+        
         self.open_demucs_model_dir_Button = ttk.Button(demucs_frame, text='Open Demucs Model Folder', command=lambda:OPEN_FILE_func(DEMUCS_MODELS_DIR))
-        self.open_demucs_model_dir_Button.grid(row=15,column=0,padx=0,pady=5)
+        self.open_demucs_model_dir_Button.grid(pady=5)
         
         self.demucs_return_Button = ttk.Button(demucs_frame, text=BACK_TO_MAIN_MENU, command=lambda:(self.menu_advanced_demucs_options_close_window(), self.check_is_menu_settings_open()))
-        self.demucs_return_Button.grid(row=16,column=0,padx=0,pady=5)
+        self.demucs_return_Button.grid(pady=5)
         
         self.demucs_close_Button = ttk.Button(demucs_frame, text='Close Window', command=lambda:self.menu_advanced_demucs_options_close_window())
-        self.demucs_close_Button.grid(row=17,column=0,padx=0,pady=5)
+        self.demucs_close_Button.grid(pady=5)
         
         demucs_pre_proc_model_title_Label = self.menu_title_LABEL_SET(demucs_pre_model_frame, "Pre-process Model")
-        demucs_pre_proc_model_title_Label.grid(row=0,column=0,padx=0,pady=15)
+        demucs_pre_proc_model_title_Label.grid(pady=15)
         
         demucs_pre_proc_model_Label = self.menu_sub_LABEL_SET(demucs_pre_model_frame, 'Select Model', font_size=FONT_SIZE_3)
-        demucs_pre_proc_model_Label.grid(row=1,column=0,padx=0,pady=0)
+        demucs_pre_proc_model_Label.grid()
         demucs_pre_proc_model_Option = ttk.OptionMenu(demucs_pre_model_frame, self.demucs_pre_proc_model_var, None, NO_MODEL, *pre_proc_list)
         demucs_pre_proc_model_Option.configure(width=33)
-        demucs_pre_proc_model_Option.grid(row=2,column=0,padx=0,pady=10)
+        demucs_pre_proc_model_Option.grid(pady=10)
         
         is_demucs_pre_proc_model_inst_mix_Option = ttk.Checkbutton(demucs_pre_model_frame, text='Save Instrumental Mixture', width=DEMUCS_PRE_CHECKBOXS_WIDTH, variable=self.is_demucs_pre_proc_model_inst_mix_var) 
-        is_demucs_pre_proc_model_inst_mix_Option.grid(row=3,column=0,padx=0,pady=0)
+        is_demucs_pre_proc_model_inst_mix_Option.grid()
         self.help_hints(is_demucs_pre_proc_model_inst_mix_Option, text=PRE_PROC_MODEL_INST_MIX_HELP)
         
         is_demucs_pre_proc_model_activate_Option = ttk.Checkbutton(demucs_pre_model_frame, text='Activate Pre-process Model', width=DEMUCS_PRE_CHECKBOXS_WIDTH, variable=self.is_demucs_pre_proc_model_activate_var, command=pre_proc_model_toggle) 
-        is_demucs_pre_proc_model_activate_Option.grid(row=4,column=0,padx=0,pady=0)
+        is_demucs_pre_proc_model_activate_Option.grid()
         self.help_hints(is_demucs_pre_proc_model_activate_Option, text=PRE_PROC_MODEL_ACTIVATE_HELP)
                 
         chunks_toggle()
@@ -2578,63 +2708,121 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.menu_advanced_mdx_options_close_window = lambda:(self.is_open_menu_advanced_mdx_options.set(False), mdx_net_opt.destroy())
         mdx_net_opt.protocol("WM_DELETE_WINDOW", self.menu_advanced_mdx_options_close_window)
 
-        tab1 = self.menu_tab_control(mdx_net_opt, self.mdx_secondary_model_vars)
+        tab1, tab3 = self.menu_tab_control(mdx_net_opt, self.mdx_secondary_model_vars, is_mdxnet=True)
+        
+        enable_chunks = lambda:(margin_Option.configure(state=tk.NORMAL), chunks_Option.configure(state=tk.NORMAL))
+        disable_chunks = lambda:(margin_Option.configure(state=tk.DISABLED), chunks_Option.configure(state=tk.DISABLED))
+        chunks_toggle = lambda:enable_chunks() if self.is_chunk_mdxnet_var.get() else disable_chunks()
         
         mdx_net_frame = self.menu_FRAME_SET(tab1)
-        mdx_net_frame.grid(row=0,column=0,padx=0,pady=0)  
+        mdx_net_frame.grid(pady=0)  
+
+        mdx_net23_frame = self.menu_FRAME_SET(tab3)
+        mdx_net23_frame.grid(pady=0)
 
         mdx_opt_title = self.menu_title_LABEL_SET(mdx_net_frame, "Advanced MDX-Net Options")
-        mdx_opt_title.grid(row=0,column=0,padx=0,pady=10)
-        
-        if not self.chosen_process_method_var.get() == MDX_ARCH_TYPE:
-            chunks_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Chunks')
-            chunks_Label.grid(row=1,column=0,padx=0,pady=5)
-            chunks_Option = ttk.Combobox(mdx_net_frame, value=CHUNKS, width=MENU_COMBOBOX_WIDTH, textvariable=self.chunks_var)
-            chunks_Option.grid(row=2,column=0,padx=0,pady=5)
-            self.combobox_entry_validation(chunks_Option, self.chunks_var, REG_CHUNKS, CHUNKS)
-            self.help_hints(chunks_Label, text=CHUNKS_HELP)
-        
-            margin_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Chunk Margin')
-            margin_Label.grid(row=3,column=0,padx=0,pady=5)
-            margin_Option = ttk.Combobox(mdx_net_frame, value=MARGIN_SIZE, width=MENU_COMBOBOX_WIDTH, textvariable=self.margin_var)
-            margin_Option.grid(row=4,column=0,padx=0,pady=5)
-            self.combobox_entry_validation(margin_Option, self.margin_var, REG_MARGIN, MARGIN_SIZE)
-            self.help_hints(margin_Label, text=MARGIN_HELP)
-        
-        mdx_batch_size_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Batch Size')
-        mdx_batch_size_Label.grid(row=5,column=0,padx=0,pady=5)
-        mdx_batch_size_Option = ttk.Combobox(mdx_net_frame, value=MDX_BATCH_SIZE, width=MENU_COMBOBOX_WIDTH, textvariable=self.mdx_batch_size_var)
-        mdx_batch_size_Option.grid(row=6,column=0,padx=0,pady=5)
-        self.combobox_entry_validation(mdx_batch_size_Option, self.mdx_batch_size_var, REG_SHIFTS, MDX_BATCH_SIZE)
-        self.help_hints(mdx_batch_size_Label, text=MDX_BATCH_SIZE_HELP)
-        
+        mdx_opt_title.grid(pady=10)
+            
         compensate_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Volume Compensation')
-        compensate_Label.grid(row=7,column=0,padx=0,pady=5)
+        compensate_Label.grid(pady=4)
         compensate_Option = ttk.Combobox(mdx_net_frame, value=VOL_COMPENSATION, width=MENU_COMBOBOX_WIDTH, textvariable=self.compensate_var)
-        compensate_Option.grid(row=8,column=0,padx=0,pady=5)
+        compensate_Option.grid(pady=4)
         self.combobox_entry_validation(compensate_Option, self.compensate_var, REG_COMPENSATION, VOL_COMPENSATION)
         self.help_hints(compensate_Label, text=COMPENSATE_HELP)
+
+        mdx_window_size_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Segment Size')
+        mdx_window_size_Label.grid(pady=4)
+        mdx_window_size_Option = ttk.Combobox(mdx_net_frame, value=MDX_WINDOW, width=MENU_COMBOBOX_WIDTH, textvariable=self.mdx_window_size_var)
+        mdx_window_size_Option.grid(pady=4)
+        self.combobox_entry_validation(mdx_window_size_Option, self.mdx_window_size_var, REG_MDX_WIN, MDX_WINDOW)
+        self.help_hints(mdx_window_size_Label, text=MDX_WINDOW_SIZE_HELP)
+
+        overlap_mdx_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Overlap')
+        overlap_mdx_Label.grid(pady=4)
+        overlap_mdx_Option = ttk.Combobox(mdx_net_frame, value=MDX_OVERLAP, width=MENU_COMBOBOX_WIDTH, textvariable=self.overlap_mdx_var)
+        overlap_mdx_Option.grid(pady=4)
+        self.combobox_entry_validation(self.overlap_mdx_Option, self.overlap_mdx_var, REG_OVERLAP, MDX_OVERLAP)
+        self.help_hints(self.overlap_mdx_Label, text=OVERLAP_HELP)
+
+        pitch_shift_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Shift Conversion Pitch')
+        pitch_shift_Label.grid(pady=5)
+        pitch_shift_Option = ttk.Combobox(mdx_net_frame, value=SEMITONE_SEL, width=MENU_COMBOBOX_WIDTH, textvariable=self.semitone_shift_var)
+        pitch_shift_Option.grid(pady=5)
+        self.combobox_entry_validation(pitch_shift_Option, self.semitone_shift_var, REG_SEMITONES, SEMI_DEF)
+        self.help_hints(pitch_shift_Label, text=PITCH_SHIFT_HELP)
+
+        is_match_frequency_pitch_Option = ttk.Checkbutton(mdx_net_frame, text='Match Freq Cut-off', width=MDX_CHECKBOXS_WIDTH, variable=self.is_match_frequency_pitch_var) 
+        is_match_frequency_pitch_Option.grid(pady=0)
+        self.help_hints(is_match_frequency_pitch_Option, text=IS_FREQUENCY_MATCH_HELP)
+
+        chunks_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Chunks')
+        #chunks_Label.grid(pady=5)
+        chunks_Option = ttk.Combobox(mdx_net_frame, value=CHUNKS, width=MENU_COMBOBOX_WIDTH, textvariable=self.chunks_var)
+        #chunks_Option.grid(pady=5)
+        self.combobox_entry_validation(chunks_Option, self.chunks_var, REG_CHUNKS, CHUNKS)
+        self.help_hints(chunks_Label, text=CHUNKS_HELP)
+    
+        margin_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Chunk Margin')
+        #margin_Label.grid(pady=5)
+        margin_Option = ttk.Combobox(mdx_net_frame, value=MARGIN_SIZE, width=MENU_COMBOBOX_WIDTH, textvariable=self.margin_var)
+        #margin_Option.grid(pady=5)
+        self.combobox_entry_validation(margin_Option, self.margin_var, REG_MARGIN, MARGIN_SIZE)
+        self.help_hints(margin_Label, text=MARGIN_HELP)
+        
+        is_chunk_mdxnet_Option = ttk.Checkbutton(mdx_net_frame, text='Apply Compensation to Primary Stem', width=MDX_CHECKBOXS_WIDTH, variable=self.is_chunk_mdxnet_var, command=chunks_toggle) 
+        #is_chunk_mdxnet_Option.grid(pady=0)
+        self.help_hints(is_chunk_mdxnet_Option, text=IS_CHUNK_MDX_NET_HELP)
         
         is_denoise_Option = ttk.Checkbutton(mdx_net_frame, text='Denoise Output', width=MDX_CHECKBOXS_WIDTH, variable=self.is_denoise_var) 
-        is_denoise_Option.grid(row=9,column=0,padx=0,pady=0)
+        is_denoise_Option.grid(pady=0)
         self.help_hints(is_denoise_Option, text=IS_DENOISE_HELP)
 
         is_invert_spec_Option = ttk.Checkbutton(mdx_net_frame, text='Spectral Inversion', width=MDX_CHECKBOXS_WIDTH, variable=self.is_invert_spec_var) 
-        is_invert_spec_Option.grid(row=10,column=0,padx=0,pady=0)
+        is_invert_spec_Option.grid(pady=0)
         self.help_hints(is_invert_spec_Option, text=IS_INVERT_SPEC_HELP)
 
         clear_mdx_cache_Button = ttk.Button(mdx_net_frame, text='Clear Auto-Set Cache', command=lambda:self.clear_cache(MDX_ARCH_TYPE))
-        clear_mdx_cache_Button.grid(row=11,column=0,padx=0,pady=5)
+        clear_mdx_cache_Button.grid(pady=5)
         self.help_hints(clear_mdx_cache_Button, text=CLEAR_CACHE_HELP)
         
         open_mdx_model_dir_Button = ttk.Button(mdx_net_frame, text='Open MDX-Net Models Folder', command=lambda:OPEN_FILE_func(MDX_MODELS_DIR))
-        open_mdx_model_dir_Button.grid(row=12,column=0,padx=0,pady=5)
+        open_mdx_model_dir_Button.grid(pady=5)
         
         mdx_return_Button = ttk.Button(mdx_net_frame, text=BACK_TO_MAIN_MENU, command=lambda:(self.menu_advanced_mdx_options_close_window(), self.check_is_menu_settings_open()))
-        mdx_return_Button.grid(row=13,column=0,padx=0,pady=5)
+        mdx_return_Button.grid(pady=5)
 
         mdx_close_Button = ttk.Button(mdx_net_frame, text='Close Window', command=lambda:self.menu_advanced_mdx_options_close_window())
-        mdx_close_Button.grid(row=14,column=0,padx=0,pady=5)
+        mdx_close_Button.grid(pady=5)
+        
+        mdx23_opt_title = self.menu_title_LABEL_SET(mdx_net23_frame, "Advanced MDX-NET23 Options")
+        mdx23_opt_title.grid(pady=10)
+        
+        mdx_batch_size_Label = self.menu_sub_LABEL_SET(mdx_net23_frame, 'Batch Size')
+        mdx_batch_size_Label.grid(pady=5)
+        mdx_batch_size_Option = ttk.Combobox(mdx_net23_frame, value=BATCH_SIZE, width=MENU_COMBOBOX_WIDTH, textvariable=self.mdx_batch_size_var)
+        mdx_batch_size_Option.grid(pady=5)
+        self.combobox_entry_validation(mdx_batch_size_Option, self.mdx_batch_size_var, REG_BATCHES, BATCH_SIZE)
+        self.help_hints(mdx_batch_size_Label, text=BATCH_SIZE_HELP)
+        
+        overlap_mdx23_Label = self.menu_sub_LABEL_SET(mdx_net23_frame, 'Overlap')
+        overlap_mdx23_Label.grid(pady=5)
+        overlap_mdx23_Option = ttk.Combobox(mdx_net23_frame, value=MDX23_OVERLAP, width=MENU_COMBOBOX_WIDTH, textvariable=self.overlap_mdx23_var)
+        overlap_mdx23_Option.grid(pady=5)
+        self.combobox_entry_validation(overlap_mdx23_Option, self.overlap_mdx23_var, REG_OVERLAP23, MDX23_OVERLAP)
+        self.help_hints(overlap_mdx23_Label, text=OVERLAP_HELP)
+        
+        is_mdx_c_seg_def_Option = ttk.Checkbutton(mdx_net23_frame, text='Segment Default', width=MDX_CHECKBOXS_WIDTH, variable=self.is_mdx_c_seg_def_var, command=chunks_toggle) 
+        is_mdx_c_seg_def_Option.grid(pady=0)
+        self.help_hints(is_mdx_c_seg_def_Option, text=IS_CHUNK_MDX_NET_HELP)
+        
+        is_mdx_combine_stems_Option = ttk.Checkbutton(mdx_net23_frame, text='Combine Stems', width=MDX_CHECKBOXS_WIDTH, variable=self.is_demucs_combine_stems_var) 
+        is_mdx_combine_stems_Option.grid()
+        self.help_hints(is_mdx_combine_stems_Option, text=IS_DEMUCS_COMBINE_STEMS_HELP)
+        
+        mdx23_close_Button = ttk.Button(mdx_net23_frame, text='Close Window', command=lambda:self.menu_advanced_mdx_options_close_window())
+        mdx23_close_Button.grid(pady=10)
+
+        chunks_toggle()
         
         self.menu_placement(mdx_net_opt, "Advanced MDX-Net Options", is_help_hints=True, close_function=self.menu_advanced_mdx_options_close_window)
 
@@ -2796,7 +2984,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         
         credit_label(place=16,
                      frame=credits_Frame,
-                     text="Audio Separation and CC Karokee & Friends Discord Communities",
+                     text="Audio Separation and CC Karaoke & Friends Discord Communities",
                      message="Thank you for the support!")
 
         more_info_tab_Frame = Frame(tab2, highlightthicknes=30)
@@ -3248,78 +3436,106 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
     def pop_up_mdx_model(self, mdx_model_hash, model_path):
         """Opens MDX-Net model settings"""
 
-        is_onnx_model = True
+        is_compatible_model = True
+        is_ckpt = False
+        primary_stem = VOCAL_STEM
         
         try:
-            model = onnx.load(model_path)
-            model_shapes = [[d.dim_value for d in _input.type.tensor_type.shape.dim] for _input in model.graph.input][0]
-            dim_f = model_shapes[2]
-            dim_t = int(math.log(model_shapes[3], 2))
+            if model_path.endswith(ONNX):
+                model = onnx.load(model_path)
+                model_shapes = [[d.dim_value for d in _input.type.tensor_type.shape.dim] for _input in model.graph.input][0]
+                dim_f = model_shapes[2]
+                dim_t = int(math.log(model_shapes[3], 2))
+                n_fft = '6144'
+                  
+            if model_path.endswith(CKPT):
+                is_ckpt = True
+                model_params = torch.load(model_path, map_location=lambda storage, loc: storage)
+                model_params = model_params['hyper_parameters']
+                dim_f = model_params['dim_f']
+                dim_t = int(math.log(model_params['dim_t'], 2))
+                n_fft = model_params['n_fft']
+                
+                for stem in STEM_SET_MENU:
+                    if model_params['target_name'] == stem.lower():
+                        primary_stem = INST_STEM if model_params['target_name'] == OTHER_STEM.lower() else stem
+                
         except Exception as e:
-            dim_f = 0
-            dim_t = 0
-            self.error_dialoge(INVALID_ONNX_MODEL_ERROR)
-            self.error_log_var.set("{}".format(error_text('MDX-Net Model Settings', e)))
-            is_onnx_model = False
-
-        if is_onnx_model:
+            is_compatible_model = False
+            if is_ckpt:
+                self.pop_up_mdx_c_param(mdx_model_hash)
+            else:
+                dim_f = 0
+                dim_t = 0
+                self.error_dialoge(INVALID_ONNX_MODEL_ERROR)
+                self.error_log_var.set("{}".format(error_text('MDX-Net Model Settings', e)))
+                self.mdx_model_params = None
+            
+        if is_compatible_model:
             mdx_model_set = Toplevel(root)
-            mdx_n_fft_scale_set_var = tk.StringVar(value='6144')
+            mdx_n_fft_scale_set_var = tk.StringVar(value=n_fft)
             mdx_dim_f_set_var = tk.StringVar(value=dim_f)
             mdx_dim_t_set_var = tk.StringVar(value=dim_t)
-            primary_stem_var = tk.StringVar(value='Vocals')
+            primary_stem_var = tk.StringVar(value=primary_stem)
             mdx_compensate_var = tk.StringVar(value=1.035)
                 
             mdx_model_set_Frame = self.menu_FRAME_SET(mdx_model_set)
             mdx_model_set_Frame.grid(row=2,column=0,padx=0,pady=0)  
             
             mdx_model_set_title = self.menu_title_LABEL_SET(mdx_model_set_Frame, "Specify MDX-Net Model Parameters")
-            mdx_model_set_title.grid(row=0,column=0,padx=0,pady=15)
+            mdx_model_set_title.grid(pady=15)
                     
             set_stem_name_Label = self.menu_sub_LABEL_SET(mdx_model_set_Frame, 'Primary Stem')
-            set_stem_name_Label.grid(row=3,column=0,padx=0,pady=5)
+            set_stem_name_Label.grid(pady=5)
             set_stem_name_Option = ttk.OptionMenu(mdx_model_set_Frame, primary_stem_var, None, *STEM_SET_MENU)
             set_stem_name_Option.configure(width=12)
-            set_stem_name_Option.grid(row=4,column=0,padx=0,pady=5)
+            set_stem_name_Option.grid(pady=5)
+            set_stem_name_Option['menu'].insert_separator(len(STEM_SET_MENU))
+            set_stem_name_Option['menu'].add_radiobutton(label=INPUT_STEM_NAME, command=tk._setit(primary_stem_var, INPUT_STEM_NAME, lambda e:self.pop_up_input_stem_name(primary_stem_var, mdx_model_set)))
             self.help_hints(set_stem_name_Label, text=SET_STEM_NAME_HELP)
 
             mdx_dim_t_set_Label = self.menu_sub_LABEL_SET(mdx_model_set_Frame, 'Dim_t')
-            mdx_dim_t_set_Label.grid(row=5,column=0,padx=0,pady=5)
+            mdx_dim_t_set_Label.grid(pady=5)
             mdx_dim_f_set_Label = self.menu_sub_LABEL_SET(mdx_model_set_Frame, '(Leave this setting as is if you are unsure.)')
-            mdx_dim_f_set_Label.grid(row=6,column=0,padx=0,pady=5)
+            mdx_dim_f_set_Label.grid(pady=5)
             mdx_dim_t_set_Option = ttk.Combobox(mdx_model_set_Frame, value=('7', '8'), textvariable=mdx_dim_t_set_var)
             mdx_dim_t_set_Option.configure(width=12)
-            mdx_dim_t_set_Option.grid(row=7,column=0,padx=0,pady=5)
+            mdx_dim_t_set_Option.grid(pady=5)
             self.help_hints(mdx_dim_t_set_Label, text=MDX_DIM_T_SET_HELP)
             
             mdx_dim_f_set_Label = self.menu_sub_LABEL_SET(mdx_model_set_Frame, 'Dim_f')
-            mdx_dim_f_set_Label.grid(row=8,column=0,padx=0,pady=5)
+            mdx_dim_f_set_Label.grid(pady=5)
             mdx_dim_f_set_Label = self.menu_sub_LABEL_SET(mdx_model_set_Frame, '(Leave this setting as is if you are unsure.)')
-            mdx_dim_f_set_Label.grid(row=9,column=0,padx=0,pady=5)
+            mdx_dim_f_set_Label.grid(pady=5)
             mdx_dim_f_set_Option = ttk.Combobox(mdx_model_set_Frame, value=(MDX_POP_DIMF), textvariable=mdx_dim_f_set_var)
             mdx_dim_f_set_Option.configure(width=12)
-            mdx_dim_f_set_Option.grid(row=10,column=0,padx=0,pady=5)
+            mdx_dim_f_set_Option.grid(pady=5)
             self.help_hints(mdx_dim_f_set_Label, text=MDX_DIM_F_SET_HELP)
 
             mdx_n_fft_scale_set_Label = self.menu_sub_LABEL_SET(mdx_model_set_Frame, 'N_FFT Scale')
-            mdx_n_fft_scale_set_Label.grid(row=11,column=0,padx=0,pady=5)
+            mdx_n_fft_scale_set_Label.grid(pady=5)
             mdx_n_fft_scale_set_Option = ttk.Combobox(mdx_model_set_Frame, values=(MDX_POP_NFFT), textvariable=mdx_n_fft_scale_set_var)
             mdx_n_fft_scale_set_Option.configure(width=12)
-            mdx_n_fft_scale_set_Option.grid(row=12,column=0,padx=0,pady=5)
+            mdx_n_fft_scale_set_Option.grid(pady=5)
             self.help_hints(mdx_n_fft_scale_set_Label, text=MDX_N_FFT_SCALE_SET_HELP)
             
             mdx_compensate_Label = self.menu_sub_LABEL_SET(mdx_model_set_Frame, 'Volume Compensation')
-            mdx_compensate_Label.grid(row=13,column=0,padx=0,pady=5)
+            mdx_compensate_Label.grid(pady=5)
             mdx_compensate_Entry = ttk.Combobox(mdx_model_set_Frame, value=('1.035', '1.08'), textvariable=mdx_compensate_var)
             mdx_compensate_Entry.configure(width=14)
-            mdx_compensate_Entry.grid(row=15,column=0,padx=0,pady=5)
+            mdx_compensate_Entry.grid(pady=5)
             self.help_hints(mdx_compensate_Label, text=POPUP_COMPENSATE_HELP)
 
             mdx_param_set_Button = ttk.Button(mdx_model_set_Frame, text="Confirm", command=lambda:pull_data())
-            mdx_param_set_Button.grid(row=16,column=0,padx=0,pady=10)
+            mdx_param_set_Button.grid(pady=10)
             
             stop_process_Button = ttk.Button(mdx_model_set_Frame, text="Cancel", command=lambda:cancel())
-            stop_process_Button.grid(row=17,column=0,padx=0,pady=0)
+            stop_process_Button.grid(pady=0)
+            
+            if is_ckpt:
+                mdx_dim_t_set_Option.configure(state=DISABLED)
+                mdx_dim_f_set_Option.configure(state=DISABLED)
+                mdx_n_fft_scale_set_Option.configure(state=DISABLED)
             
             def pull_data():
                 mdx_model_params = {
@@ -3349,13 +3565,62 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         with open(os.path.join(MDX_HASH_DIR, f'{mdx_model_hash}.json'), "w") as outfile:
             outfile.write(mdx_model_params_dump)
         
+    def pop_up_mdx_c_param(self, mdx_model_hash):
+        """Opens MDX-C param settings"""
+
+        mdx_c_param_menu = Toplevel()
+        
+        get_mdx_c_params = lambda dir, ext:tuple(os.path.splitext(x)[0] for x in os.listdir(dir) if x.endswith(ext))
+        new_mdx_c_params = get_mdx_c_params(MDX_C_CONFIG_PATH, YAML)
+        mdx_c_model_param_var = tk.StringVar(value='None Selected')
+        
+        def pull_data():
+            mdx_c_model_params = {
+                'config_yaml': f"{mdx_c_model_param_var.get()}{YAML}"}
+            
+            if not mdx_c_model_param_var.get() == 'None Selected':
+                self.pop_up_mdx_model_sub_json_dump(mdx_c_model_params, mdx_model_hash)
+                mdx_c_param_menu.destroy()
+            else:
+                self.mdx_model_params = None
+        
+        def cancel():
+            self.mdx_model_params = None
+            mdx_c_param_menu.destroy()
+        
+        mdx_c_param_Frame = self.menu_FRAME_SET(mdx_c_param_menu)
+        mdx_c_param_Frame.grid(row=0,column=0,padx=0,pady=0)  
+        
+        mdx_c_param_title_title = self.menu_title_LABEL_SET(mdx_c_param_Frame, "MDX-Net C Model Parameters", width=28)
+        mdx_c_param_title_title.grid(row=0,column=0,padx=0,pady=0)
+                
+        mdx_c_model_param_Label = self.menu_sub_LABEL_SET(mdx_c_param_Frame, 'Select Model Param')
+        mdx_c_model_param_Label.grid(pady=5)
+        mdx_c_model_param_Option = ttk.OptionMenu(mdx_c_param_Frame, mdx_c_model_param_var)
+        mdx_c_model_param_Option.configure(width=30)
+        mdx_c_model_param_Option.grid(padx=20,pady=5)
+        self.help_hints(mdx_c_model_param_Label, text=VR_MODEL_PARAM_HELP)
+
+        mdx_c_param_confrim_Button = ttk.Button(mdx_c_param_Frame, text='Confirm', command=lambda:pull_data())
+        mdx_c_param_confrim_Button.grid(pady=5)
+        
+        mdx_c_param_cancel_Button = ttk.Button(mdx_c_param_Frame, text='Cancel', command=cancel)
+        mdx_c_param_cancel_Button.grid(pady=5)
+        
+        for option_name in new_mdx_c_params:
+            mdx_c_model_param_Option['menu'].add_radiobutton(label=option_name, command=tk._setit(mdx_c_model_param_var, option_name))
+        
+        mdx_c_param_menu.protocol("WM_DELETE_WINDOW", cancel)
+        
+        self.menu_placement(mdx_c_param_menu, "Choose Model Param", pop_up=True)
+        
     def pop_up_vr_param(self, vr_model_hash):
         """Opens VR param settings"""
 
         vr_param_menu = Toplevel()
         
         get_vr_params = lambda dir, ext:tuple(os.path.splitext(x)[0] for x in os.listdir(dir) if x.endswith(ext))
-        new_vr_params = get_vr_params(VR_PARAM_DIR, '.json')
+        new_vr_params = get_vr_params(VR_PARAM_DIR, JSON)
         vr_model_param_var = tk.StringVar(value='None Selected')
         vr_model_stem_var = tk.StringVar(value='Vocals')
         
@@ -3384,6 +3649,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         vr_model_stem_Label.grid(row=1,column=0,padx=0,pady=5)    
         vr_model_stem_Option = ttk.OptionMenu(vr_param_Frame, vr_model_stem_var, None, *STEM_SET_MENU)
         vr_model_stem_Option.grid(row=2,column=0,padx=20,pady=5)
+        vr_model_stem_Option['menu'].insert_separator(len(STEM_SET_MENU))
+        vr_model_stem_Option['menu'].add_radiobutton(label=INPUT_STEM_NAME, command=tk._setit(vr_model_stem_var, INPUT_STEM_NAME, lambda e:self.pop_up_input_stem_name(vr_model_stem_var, vr_param_menu)))
         self.help_hints(vr_model_stem_Label, text=SET_STEM_NAME_HELP)
                 
         vr_model_param_Label = self.menu_sub_LABEL_SET(vr_param_Frame, 'Select Model Param')
@@ -3415,6 +3682,73 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         
         with open(os.path.join(VR_HASH_DIR, f'{vr_model_hash}.json'), "w") as outfile:
             outfile.write(vr_model_params_dump)
+
+    def pop_up_input_stem_name(self, stem_var:tk.StringVar, parent_window:Toplevel):
+        """
+        Input Stem Name
+        """
+        
+        stem_input_save = Toplevel(root)
+        
+        def close_window(is_cancel=True):
+            
+            if is_cancel or not stem_input_save_var.get():
+                stem_var.set(VOCAL_STEM)
+            else:
+                stem_input_save_text = stem_input_save_var.get().capitalize()
+                
+                if stem_input_save_text == VOCAL_STEM:
+                    stem_text = INST_STEM if is_inverse_stem_var.get() else stem_input_save_text
+                elif stem_input_save_text == INST_STEM:
+                    stem_text = VOCAL_STEM if is_inverse_stem_var.get() else stem_input_save_text
+                else:
+                    stem_text = f"{NO_STEM}{stem_input_save_text}" if is_inverse_stem_var.get() else stem_input_save_text
+                    
+                stem_var.set(stem_text)
+
+            stem_input_save.destroy()
+            
+            parent_window.attributes('-topmost', 'true') if OPERATING_SYSTEM == "Linux" else None
+            parent_window.grab_set()
+            root.wait_window(parent_window)
+        
+        stem_input_save_var = tk.StringVar(value='')
+        entry_validation_header_var = tk.StringVar(value='Input Notes')
+        is_inverse_stem_var = tk.BooleanVar(value=False)
+
+        stem_input_save_Frame = self.menu_FRAME_SET(stem_input_save)
+        stem_input_save_Frame.grid(row=1,column=0,padx=0,pady=0)  
+        
+        validation = lambda value:False if re.fullmatch(REG_INPUT_STEM_NAME, value) is None and stem_input_save_var.get() else True
+        invalid = lambda:(entry_validation_header_var.set(INVALID_ENTRY))
+
+        stem_input_save_title = self.menu_title_LABEL_SET(stem_input_save_Frame, "Input Stem Name")
+        stem_input_save_title.grid(pady=0)
+        
+        stem_input_name_Label = self.menu_sub_LABEL_SET(stem_input_save_Frame, 'Stem Name')
+        stem_input_name_Label.grid(pady=5)
+        stem_input_name_Entry = ttk.Combobox(stem_input_save_Frame, textvariable=stem_input_save_var, values=STEM_SET_MENU_2, justify='center', width=25)
+        stem_input_name_Entry.grid(pady=5)
+        stem_input_name_Entry.config(validate='focus', validatecommand=(self.register(validation), '%P'), invalidcommand=(self.register(invalid),))
+        
+        is_inverse_stem_Button = ttk.Checkbutton(stem_input_save_Frame, text="Is Inverse Stem", variable=is_inverse_stem_var)
+        is_inverse_stem_Button.grid(pady=0)
+        
+        entry_validation_header_Label = tk.Label(stem_input_save_Frame, textvariable=entry_validation_header_var, font=(MAIN_FONT_NAME, f"{FONT_SIZE_1}"), foreground='#868687', justify="left")
+        entry_validation_header_Label.grid(pady=0)
+        
+        entry_rules_Label = tk.Label(stem_input_save_Frame, text=STEM_INPUT_RULE, font=(MAIN_FONT_NAME, f"{FONT_SIZE_1}"), foreground='#868687', justify="left")
+        entry_rules_Label.grid(pady=0)     
+        
+        mdx_param_set_Button = ttk.Button(stem_input_save_Frame, text="Done", command=lambda:close_window(is_cancel=False) if validation(stem_input_save_var.get()) else None)
+        mdx_param_set_Button.grid(pady=5)
+        
+        stop_process_Button = ttk.Button(stem_input_save_Frame, text="Cancel", command=close_window)
+        stop_process_Button.grid(pady=5)
+
+        stem_input_save.protocol("WM_DELETE_WINDOW", close_window)
+
+        self.menu_placement(stem_input_save, "Input Unique Stem Name", pop_up=True, stem_combobox=stem_input_name_Entry)
 
     def pop_up_save_ensemble(self):
         """
@@ -3525,7 +3859,6 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
 
                 if user_refresh:
                     self.download_list_state()
-                    #self.download_list_fill()
                     for widget in self.download_center_Buttons:widget.configure(state=tk.NORMAL)
                     
                 if refresh_list_Button:
@@ -3563,7 +3896,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                         if not is_beta_version:
                             self.command_Text.write(f"\n\nNew Update Found: {self.lastest_version}\n\nClick the update button in the \"Settings\" menu to download and install!")
 
-                self.download_model_settings()
+                if self.is_auto_update_model_params_var.get():
+                    self.download_model_settings()
 
             except Exception as e:
                 self.error_log_var.set(error_text('Online Data Refresh', e))
@@ -3692,7 +4026,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
     def download_list_state(self, reset=True, disable_only=False):
         """Makes sure only the models from the chosen AI network are selectable."""
         
-        for widget in self.download_lists:widget.configure(state=tk.DISABLED)
+        for widget in self.download_lists:
+            widget.configure(state=tk.DISABLED)
         
         if reset:
             for download_list_var in self.download_list_vars:
@@ -3704,7 +4039,6 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                     self.download_Button.configure(state=tk.DISABLED)
             
         if not disable_only:
-            
             self.download_Button.configure(state=tk.NORMAL)
             if self.select_download_var.get() == VR_ARCH_TYPE:
                 self.model_download_vr_Option.configure(state=tk.NORMAL)
@@ -3887,11 +4221,11 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         
         def fix_names(file, name_mapper: dict):return tuple(new_name for (old_name, new_name) in name_mapper.items() if file in old_name)
         
-        new_vr_models = self.get_files_from_dir(VR_MODELS_DIR, '.pth')
-        new_mdx_models = self.get_files_from_dir(MDX_MODELS_DIR, '.onnx')
-        new_demucs_models = self.get_files_from_dir(DEMUCS_MODELS_DIR, ('.ckpt', '.gz', '.th')) + self.get_files_from_dir(DEMUCS_NEWER_REPO_DIR, '.yaml')
-        new_ensembles_found = self.get_files_from_dir(ENSEMBLE_CACHE_DIR, '.json')
-        new_settings_found = self.get_files_from_dir(SETTINGS_CACHE_DIR, '.json')
+        new_vr_models = self.get_files_from_dir(VR_MODELS_DIR, PTH)
+        new_mdx_models = self.get_files_from_dir(MDX_MODELS_DIR, (ONNX, CKPT), is_mdxnet=True)
+        new_demucs_models = self.get_files_from_dir(DEMUCS_MODELS_DIR, (CKPT, '.gz', '.th')) + self.get_files_from_dir(DEMUCS_NEWER_REPO_DIR, YAML)
+        new_ensembles_found = self.get_files_from_dir(ENSEMBLE_CACHE_DIR, JSON)
+        new_settings_found = self.get_files_from_dir(SETTINGS_CACHE_DIR, JSON)
         new_models_found = new_vr_models + new_mdx_models + new_demucs_models
         is_online = self.is_online_model_menu
         
@@ -3977,10 +4311,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         if self.chosen_process_method_var.get() == MDX_ARCH_TYPE:
             self.mdx_net_model_Label_place()
             self.mdx_net_model_Option_place()
-            self.chunks_Label_place()
-            self.chunks_Option_place()
-            self.margin_Label_place()
-            self.margin_Option_place()
+            self.mdx_batch_size_Label_place()
+            self.mdx_batch_size_Option_place()
             general_shared_Buttons_place()
             stem_save_Options_place()
             no_ensemble_shared()
@@ -4015,7 +4347,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                 self.time_stretch_rate_Label_place()
                 self.time_stretch_rate_Option_place()
             elif self.chosen_audio_tool_var.get() == CHANGE_PITCH:
-                self.model_sample_mode_Option_place(rely=5)
+                self.is_time_correction_Option_place()
+                self.model_sample_mode_Option_place(rely=6)
                 self.pitch_rate_Label_place()
                 self.pitch_rate_Option_place()
         elif self.chosen_process_method_var.get() == ENSEMBLE_MODE:
@@ -4038,52 +4371,90 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
     def update_button_states(self):
         """Updates the available stems for selected Demucs model"""
         
-        if self.demucs_stems_var.get() == ALL_STEMS:
-            self.update_stem_checkbox_labels(PRIMARY_STEM, demucs=True)
-        elif self.demucs_stems_var.get() == VOCAL_STEM:
-            self.update_stem_checkbox_labels(VOCAL_STEM, demucs=True, is_disable_demucs_boxes=False)
-            self.is_stem_only_Demucs_Options_Enable()
-        else:
-            self.is_stem_only_Demucs_Options_Enable()
-
-        self.demucs_stems_Option['menu'].delete(0,'end')
-        
-        if not self.demucs_model_var.get() == CHOOSE_MODEL:
-            if DEMUCS_UVR_MODEL in self.demucs_model_var.get():
-                stems = DEMUCS_2_STEM_OPTIONS
-            elif DEMUCS_6_STEM_MODEL in self.demucs_model_var.get():
-                stems = DEMUCS_6_STEM_OPTIONS
+        if self.chosen_process_method_var.get() == DEMUCS_ARCH_TYPE:
+            if self.demucs_stems_var.get() == ALL_STEMS:
+                self.update_stem_checkbox_labels(PRIMARY_STEM, demucs=True)
+            elif self.demucs_stems_var.get() == VOCAL_STEM:
+                self.update_stem_checkbox_labels(VOCAL_STEM, demucs=True, is_disable_demucs_boxes=False)
+                self.is_stem_only_Demucs_Options_Enable()
             else:
-                stems = DEMUCS_4_STEM_OPTIONS
+                self.is_stem_only_Demucs_Options_Enable()
 
-            for stem in stems:
-                self.demucs_stems_Option['menu'].add_radiobutton(label=stem, 
-                                                                 command=tk._setit(self.demucs_stems_var, stem, lambda s:self.update_stem_checkbox_labels(s, demucs=True)))
+            self.demucs_stems_Option['menu'].delete(0,'end')
+            
+            if not self.demucs_model_var.get() == CHOOSE_MODEL:
+                if DEMUCS_UVR_MODEL in self.demucs_model_var.get():
+                    stems = DEMUCS_2_STEM_OPTIONS
+                elif DEMUCS_6_STEM_MODEL in self.demucs_model_var.get():
+                    stems = DEMUCS_6_STEM_OPTIONS
+                else:
+                    stems = DEMUCS_4_STEM_OPTIONS
 
+                for stem in stems:
+                    self.demucs_stems_Option['menu'].add_radiobutton(label=stem, 
+                                                                    command=tk._setit(self.demucs_stems_var, stem, lambda s:self.update_stem_checkbox_labels(s, demucs=True)))
+
+    def update_button_states_mdx(self, model_stems):
+        """Updates the available stems for selected Demucs model"""
+        
+        model_stems = [stem for stem in model_stems]
+        
+        if len(model_stems) >= 3:
+            model_stems.insert(0, ALL_STEMS)
+            self.mdxnet_stems_var.set(ALL_STEMS)
+        else:
+            self.mdxnet_stems_var.set(model_stems[0])
+        
+        if self.mdxnet_stems_var.get() == ALL_STEMS:
+            self.update_stem_checkbox_labels(PRIMARY_STEM, disable_boxes=True)
+        elif self.mdxnet_stems_var.get() == VOCAL_STEM:
+            self.update_stem_checkbox_labels(VOCAL_STEM)
+            self.is_stem_only_Options_Enable()
+        else:
+            self.is_stem_only_Options_Enable()
+
+        self.mdxnet_stems_Option['menu'].delete(0,'end')
+        
+        if not self.mdx_net_model_var.get() == CHOOSE_MODEL:
+            for stem in model_stems:
+                self.mdxnet_stems_Option['menu'].add_radiobutton(label=stem, 
+                                                                    command=tk._setit(self.mdxnet_stems_var, stem, self.update_stem_checkbox_labels))
+                            
     def update_stem_checkbox_labels(self, selection, demucs=False, disable_boxes=False, is_disable_demucs_boxes=True):
         """Updates the "save only" checkboxes based on the model selected"""
         
         stem_text = self.is_primary_stem_only_Text_var, self.is_secondary_stem_only_Text_var
-        
-        if disable_boxes:
+
+        if selection == ALL_STEMS:
+            selection = PRIMARY_STEM
+        else:
+            self.is_stem_only_Options_Enable()
+
+        if disable_boxes or selection == PRIMARY_STEM:
             self.is_primary_stem_only_Option.configure(state=tk.DISABLED)
             self.is_secondary_stem_only_Option.configure(state=tk.DISABLED)
             self.is_primary_stem_only_var.set(False)
             self.is_secondary_stem_only_var.set(False)
+        else:
+            self.is_primary_stem_only_Option.configure(state=tk.NORMAL)
+            self.is_secondary_stem_only_Option.configure(state=tk.NORMAL)
         
         if demucs:
             stem_text = self.is_primary_stem_only_Demucs_Text_var, self.is_secondary_stem_only_Demucs_Text_var
+
             if is_disable_demucs_boxes:
                 self.is_primary_stem_only_Demucs_Option.configure(state=tk.DISABLED)
                 self.is_secondary_stem_only_Demucs_Option.configure(state=tk.DISABLED)
                 self.is_primary_stem_only_Demucs_var.set(False)
                 self.is_secondary_stem_only_Demucs_var.set(False)
-
-        for primary_stem, secondary_stem in STEM_PAIR_MAPPER.items():
-            if selection == primary_stem:
-                stem_text[0].set(f"{primary_stem} Only")
-                stem_text[1].set(f"{secondary_stem} Only")
-              
+                
+            if not selection == PRIMARY_STEM:
+                self.is_primary_stem_only_Demucs_Option.configure(state=tk.NORMAL)
+                self.is_secondary_stem_only_Demucs_Option.configure(state=tk.NORMAL)
+                
+        stem_text[0].set(f"{selection} Only")
+        stem_text[1].set(f"{secondary_stem(selection)} Only")
+     
     def update_ensemble_algorithm_menu(self, is_4_stem=False):
         
         self.ensemble_type_Option['menu'].delete(0, 'end')
@@ -4094,7 +4465,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
 
         for choice in options:
             self.ensemble_type_Option['menu'].add_command(label=choice, command=tk._setit(self.ensemble_type_var, choice))
-                                     
+                     
     def selection_action_models(self, selection):
         """Accepts model names and verifies their state"""
 
@@ -4128,13 +4499,33 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         if not model_data.model_status:
             var.set(CHOOSE_MODEL)
             self.update_stem_checkbox_labels(PRIMARY_STEM, disable_boxes=True)
+            if ai_type == MDX_ARCH_TYPE:
+                self.compensate_Label_place()
+                self.compensate_Option_place()
+                self.overlap_mdx_Label_place()
+                self.overlap_mdx_Option_place()
         else:
             if ai_type == DEMUCS_ARCH_TYPE:
                 if not self.demucs_stems_var.get().lower() in model_data.demucs_source_list:
                     self.demucs_stems_var.set(ALL_STEMS if model_data.demucs_stem_count == 4 else VOCAL_STEM)
+                    
+                self.update_button_states()
             else:
-                stem = model_data.primary_stem
-                self.update_stem_checkbox_labels(stem)
+                if model_data.is_mdx_c and len(model_data.mdx_model_stems) >= 2:
+                    self.mdxnet_stems_Label_place()
+                    self.mdxnet_stems_Option_place()
+                    self.mdx_batch_size_Label_place()
+                    self.mdx_batch_size_Option_place()
+                    self.update_button_states_mdx(model_data.mdx_model_stems)
+                else:
+                    if ai_type == MDX_ARCH_TYPE:
+                        self.compensate_Label_place()
+                        self.compensate_Option_place()
+                        self.overlap_mdx_Label_place()
+                        self.overlap_mdx_Option_place()
+
+                    stem = model_data.primary_stem
+                    self.update_stem_checkbox_labels(stem)
 
     def selection_action_process_method(self, selection, from_widget=False):
         """Checks model and variable status when toggling between process methods"""
@@ -4143,7 +4534,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.save_current_settings_var.set(CHOOSE_ENSEMBLE_OPTION)
         
         if selection == ENSEMBLE_MODE:
-            if self.ensemble_main_stem_var.get() in [CHOOSE_STEM_PAIR, FOUR_STEM_ENSEMBLE]:
+            if self.ensemble_main_stem_var.get() in [CHOOSE_STEM_PAIR, FOUR_STEM_ENSEMBLE, MULTI_STEM_ENSEMBLE]:
                 self.update_stem_checkbox_labels(PRIMARY_STEM, disable_boxes=True)
             else:
                 self.update_stem_checkbox_labels(self.return_ensemble_stems(is_primary=True))
@@ -4192,18 +4583,23 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             
             for i in indexes:
                 self.ensemble_listbox_Option.selection_set(i)
+                
+        self.update_checkbox_text()
             
     def selection_action_ensemble_stems(self, selection: str, from_menu=True, auto_update=None):
         """Filters out all models from ensemble listbox that are incompatible with selected ensemble stem"""
         
+        is_multi_stem = False
+        
         if not selection == CHOOSE_STEM_PAIR:
-
-            if selection == FOUR_STEM_ENSEMBLE:
+            if selection in [FOUR_STEM_ENSEMBLE, MULTI_STEM_ENSEMBLE]:
                 self.update_stem_checkbox_labels(PRIMARY_STEM, disable_boxes=True)
                 self.update_ensemble_algorithm_menu(is_4_stem=True)
                 self.ensemble_primary_stem = PRIMARY_STEM
                 self.ensemble_secondary_stem = SECONDARY_STEM
                 is_4_stem_check = True
+                if selection == MULTI_STEM_ENSEMBLE:
+                    is_multi_stem = True
             else:
                 self.update_ensemble_algorithm_menu()
                 self.is_stem_only_Options_Enable()
@@ -4213,7 +4609,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                 self.ensemble_secondary_stem = stems[2]
                 is_4_stem_check = False
             
-            self.model_stems_list = self.model_list(self.ensemble_primary_stem, self.ensemble_secondary_stem, is_4_stem_check=is_4_stem_check)
+            self.model_stems_list = self.model_list(self.ensemble_primary_stem, self.ensemble_secondary_stem, is_4_stem_check=is_4_stem_check, is_multi_stem=is_multi_stem)
             self.ensemble_listbox_Option.configure(state=tk.NORMAL)
             self.ensemble_listbox_clear_and_insert_new(self.model_stems_list)
 
@@ -4397,7 +4793,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.conversion_Button_Text_var.set(START_PROCESSING)
         self.conversion_Button.configure(state=tk.NORMAL)
         self.progress_bar_main_var.set(0)
-        
+
         if error:
             error_message_box_text = f'{error_dialouge(error)}{ERROR_OCCURED[1]}'
             confirm = tk.messagebox.askyesno(parent=root,
@@ -4588,6 +4984,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         inputPaths = self.inputPaths
         inputPath_total_len = len(inputPaths)
         is_model_sample_mode = self.model_sample_mode_var.get()
+        
         try:
             if self.chosen_process_method_var.get() == ENSEMBLE_MODE:
                 model, ensemble = self.assemble_model_data(), Ensembler()
@@ -4657,12 +5054,12 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                                     'cached_model_source_holder': self.cached_model_source_holder,
                                     'list_all_models': self.all_models,
                                     'is_ensemble_master': is_ensemble,
-                                    'is_4_stem_ensemble': True if self.ensemble_main_stem_var.get() == FOUR_STEM_ENSEMBLE and is_ensemble else False}
+                                    'is_4_stem_ensemble': True if self.ensemble_main_stem_var.get() in [FOUR_STEM_ENSEMBLE, MULTI_STEM_ENSEMBLE] and is_ensemble else False}
                     
                     if current_model.process_method == VR_ARCH_TYPE:
                         seperator = SeperateVR(current_model, process_data)
                     if current_model.process_method == MDX_ARCH_TYPE:
-                        seperator = SeperateMDX(current_model, process_data)
+                        seperator = SeperateMDXC(current_model, process_data) if current_model.is_mdx_c else SeperateMDX(current_model, process_data)
                     if current_model.process_method == DEMUCS_ARCH_TYPE:
                         seperator = SeperateDemucs(current_model, process_data)
                         
@@ -4676,8 +5073,9 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                     audio_file_base = audio_file_base.replace(f"_{current_model.model_basename}","")
                     self.command_Text.write(base_text + ENSEMBLING_OUTPUTS)
                     
-                    if self.ensemble_main_stem_var.get() == FOUR_STEM_ENSEMBLE:
-                        for output_stem in DEMUCS_4_SOURCE_LIST:
+                    if self.ensemble_main_stem_var.get() in [FOUR_STEM_ENSEMBLE, MULTI_STEM_ENSEMBLE]:
+                        stem_list = extract_stems(export_path)
+                        for output_stem in stem_list:
                             ensemble.ensemble_outputs(audio_file_base, export_path, output_stem, is_4_stem=True)
                     else:
                         if not self.is_secondary_stem_only_var.get():
@@ -4707,7 +5105,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
                 playsound(COMPLETE_CHIME) if self.is_task_complete_var.get() else None
                 
             self.process_end()
-                
+                        
         except Exception as e:
             self.error_log_var.set("{}{}".format(error_text(self.chosen_process_method_var.get(), e), self.get_settings_list()))
             self.command_Text.write(f'\n\n{PROCESS_FAILED}')
@@ -4735,8 +5133,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         for key, value in DEFAULT_DATA.items():
             if not key in data.keys():
                 data = {**data, **{key:value}}
-                data['chunks'] = BATCH_MODE if key == 'mdx_batch_size' else data['chunks']
-        
+                data['batch_size'] = DEF_OPT
+
         ## ADD_BUTTON
         self.chosen_process_method_var = tk.StringVar(value=data['chosen_process_method'])
         
@@ -4744,6 +5142,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.vr_model_var = tk.StringVar(value=data['vr_model'])
         self.aggression_setting_var = tk.StringVar(value=data['aggression_setting'])
         self.window_size_var = tk.StringVar(value=data['window_size'])
+        self.mdx_window_size_var = tk.StringVar(value=data['mdx_window_size'])
         self.batch_size_var = tk.StringVar(value=data['batch_size'])
         self.crop_size_var = tk.StringVar(value=data['crop_size'])
         self.is_tta_var = tk.BooleanVar(value=data['is_tta'])
@@ -4765,10 +5164,13 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.demucs_model_var = tk.StringVar(value=data['demucs_model'])
         self.segment_var = tk.StringVar(value=data['segment'])
         self.overlap_var = tk.StringVar(value=data['overlap'])
+        self.overlap_mdx_var = tk.StringVar(value=data['overlap_mdx'])
+        self.overlap_mdx23_var = tk.StringVar(value=data['overlap_mdx23'])
         self.shifts_var = tk.StringVar(value=data['shifts'])
         self.chunks_demucs_var = tk.StringVar(value=data['chunks_demucs'])
         self.margin_demucs_var = tk.StringVar(value=data['margin_demucs'])
         self.is_chunk_demucs_var = tk.BooleanVar(value=data['is_chunk_demucs'])
+        self.is_chunk_mdxnet_var = tk.BooleanVar(value=False)
         self.is_primary_stem_only_Demucs_var = tk.BooleanVar(value=data['is_primary_stem_only_Demucs'])
         self.is_secondary_stem_only_Demucs_var = tk.BooleanVar(value=data['is_secondary_stem_only_Demucs'])
         self.is_split_mode_var = tk.BooleanVar(value=data['is_split_mode'])
@@ -4791,8 +5193,11 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.chunks_var = tk.StringVar(value=data['chunks'])
         self.margin_var = tk.StringVar(value=data['margin'])
         self.compensate_var = tk.StringVar(value=data['compensate'])
-        self.is_denoise_var = tk.BooleanVar(value=data['is_denoise'])
+        self.is_denoise_var = tk.BooleanVar(value=data['is_denoise'])#is_match_frequency_pitch
+        self.is_match_frequency_pitch_var = tk.BooleanVar(value=data['is_match_frequency_pitch'])#
+        self.is_mdx_c_seg_def_var = tk.BooleanVar(value=data['is_mdx_c_seg_def'])#
         self.is_invert_spec_var = tk.BooleanVar(value=data['is_invert_spec'])
+        self.is_mixer_mode_var = tk.BooleanVar(value=data['is_mixer_mode'])
         self.mdx_batch_size_var = tk.StringVar(value=data['mdx_batch_size'])
         self.mdx_voc_inst_secondary_model_var = tk.StringVar(value=data['mdx_voc_inst_secondary_model'])
         self.mdx_other_secondary_model_var = tk.StringVar(value=data['mdx_other_secondary_model'])
@@ -4803,7 +5208,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.mdx_other_secondary_model_scale_var = tk.StringVar(value=data['mdx_other_secondary_model_scale'])
         self.mdx_bass_secondary_model_scale_var = tk.StringVar(value=data['mdx_bass_secondary_model_scale'])
         self.mdx_drums_secondary_model_scale_var = tk.StringVar(value=data['mdx_drums_secondary_model_scale'])
-    
+        self.is_mdxnet_c_model_var = tk.BooleanVar(value=False)
+
         #Ensemble Vars
         self.is_save_all_outputs_ensemble_var = tk.BooleanVar(value=data['is_save_all_outputs_ensemble'])
         self.is_append_ensemble_name_var = tk.BooleanVar(value=data['is_append_ensemble_name'])
@@ -4813,8 +5219,10 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.choose_algorithm_var = tk.StringVar(value=data['choose_algorithm'])
         self.time_stretch_rate_var = tk.StringVar(value=data['time_stretch_rate'])
         self.pitch_rate_var = tk.StringVar(value=data['pitch_rate'])
+        self.is_time_correction_var = tk.BooleanVar(value=data['is_time_correction'])
 
         #Shared Vars
+        self.semitone_shift_var = tk.StringVar(value=data['semitone_shift'])
         self.mp3_bit_set_var = tk.StringVar(value=data['mp3_bit_set'])
         self.save_format_var = tk.StringVar(value=data['save_format'])
         self.wav_type_set_var = tk.StringVar(value=data['wav_type_set'])
@@ -4822,7 +5230,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.is_gpu_conversion_var = tk.BooleanVar(value=data['is_gpu_conversion'])
         self.is_primary_stem_only_var = tk.BooleanVar(value=data['is_primary_stem_only'])
         self.is_secondary_stem_only_var = tk.BooleanVar(value=data['is_secondary_stem_only'])
-        self.is_testing_audio_var = tk.BooleanVar(value=data['is_testing_audio'])
+        self.is_testing_audio_var = tk.BooleanVar(value=data['is_testing_audio'])#
+        self.is_auto_update_model_params_var = tk.BooleanVar(value=data['is_auto_update_model_params'])#
         self.is_add_model_name_var = tk.BooleanVar(value=data['is_add_model_name'])
         self.is_accept_any_input_var = tk.BooleanVar(value=data['is_accept_any_input'])
         self.is_task_complete_var = tk.BooleanVar(value=data['is_task_complete'])
@@ -4844,6 +5253,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         for key, value in DEFAULT_DATA.items():
             if not key in loaded_setting.keys():
                 loaded_setting = {**loaded_setting, **{key:value}}
+                loaded_setting['batch_size'] = DEF_OPT
         
         is_ensemble = True if process_method == ENSEMBLE_MODE else False
         
@@ -4851,6 +5261,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.vr_model_var.set(loaded_setting['vr_model'])
             self.aggression_setting_var.set(loaded_setting['aggression_setting'])
             self.window_size_var.set(loaded_setting['window_size'])
+            self.mdx_window_size_var.set(loaded_setting['mdx_window_size'])
             self.batch_size_var.set(loaded_setting['batch_size'])
             self.crop_size_var.set(loaded_setting['crop_size'])
             self.is_tta_var.set(loaded_setting['is_tta'])
@@ -4876,6 +5287,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.chunks_demucs_var.set(loaded_setting['chunks_demucs'])
             self.margin_demucs_var.set(loaded_setting['margin_demucs'])
             self.is_chunk_demucs_var.set(loaded_setting['is_chunk_demucs'])
+            self.is_chunk_mdxnet_var.set(loaded_setting['is_chunk_mdxnet'])
             self.is_primary_stem_only_Demucs_var.set(loaded_setting['is_primary_stem_only_Demucs'])
             self.is_secondary_stem_only_Demucs_var.set(loaded_setting['is_secondary_stem_only_Demucs'])
             self.is_split_mode_var.set(loaded_setting['is_split_mode'])
@@ -4891,6 +5303,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.demucs_drums_secondary_model_scale_var.set(loaded_setting['demucs_drums_secondary_model_scale'])
             self.demucs_stems_var.set(loaded_setting['demucs_stems'])
             self.update_stem_checkbox_labels(self.demucs_stems_var.get(), demucs=True)
+            self.mdxnet_stems_var.set(loaded_setting['mdx_stems'])
             self.demucs_pre_proc_model_var.set(data['demucs_pre_proc_model'])
             self.is_demucs_pre_proc_model_activate_var.set(data['is_demucs_pre_proc_model_activate'])
             self.is_demucs_pre_proc_model_inst_mix_var.set(data['is_demucs_pre_proc_model_inst_mix'])
@@ -4900,8 +5313,13 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.chunks_var.set(loaded_setting['chunks'])
             self.margin_var.set(loaded_setting['margin'])
             self.compensate_var.set(loaded_setting['compensate'])
-            self.is_denoise_var.set(loaded_setting['is_denoise'])
+            self.is_denoise_var.set(loaded_setting['is_denoise'])#is_match_frequency_pitch
+            self.is_match_frequency_pitch_var.set(loaded_setting['is_match_frequency_pitch'])#
+            self.overlap_mdx_var.set(loaded_setting['overlap_mdx'])
+            self.overlap_mdx23_var.set(loaded_setting['overlap_mdx23'])
+            self.is_mdx_c_seg_def_var.set(loaded_setting['is_mdx_c_seg_def'])#
             self.is_invert_spec_var.set(loaded_setting['is_invert_spec'])
+            self.is_mixer_mode_var.set(loaded_setting['is_mixer_mode'])
             self.mdx_batch_size_var.set(loaded_setting['mdx_batch_size'])
             self.mdx_voc_inst_secondary_model_var.set(loaded_setting['mdx_voc_inst_secondary_model'])
             self.mdx_other_secondary_model_var.set(loaded_setting['mdx_other_secondary_model'])
@@ -4919,15 +5337,18 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.chosen_audio_tool_var.set(loaded_setting['chosen_audio_tool'])
             self.choose_algorithm_var.set(loaded_setting['choose_algorithm'])
             self.time_stretch_rate_var.set(loaded_setting['time_stretch_rate'])
-            self.pitch_rate_var.set(loaded_setting['pitch_rate'])
+            self.pitch_rate_var.set(loaded_setting['pitch_rate'])#
+            self.is_time_correction_var.set(loaded_setting['is_time_correction'])#
             self.is_primary_stem_only_var.set(loaded_setting['is_primary_stem_only'])
             self.is_secondary_stem_only_var.set(loaded_setting['is_secondary_stem_only'])
-            self.is_testing_audio_var.set(loaded_setting['is_testing_audio'])
+            self.is_testing_audio_var.set(loaded_setting['is_testing_audio'])#
+            self.is_auto_update_model_params_var.set(loaded_setting['is_auto_update_model_params'])
             self.is_add_model_name_var.set(loaded_setting['is_add_model_name'])
             self.is_accept_any_input_var.set(loaded_setting["is_accept_any_input"])
             self.is_task_complete_var.set(loaded_setting['is_task_complete'])
             self.is_create_model_folder_var.set(loaded_setting['is_create_model_folder'])
             self.mp3_bit_set_var.set(loaded_setting['mp3_bit_set'])
+            self.semitone_shift_var.set(loaded_setting['semitone_shift'])#
             self.save_format_var.set(loaded_setting['save_format'])
             self.wav_type_set_var.set(loaded_setting['wav_type_set'])
             self.user_code_var.set(loaded_setting['user_code'])
@@ -4948,6 +5369,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             'vr_model': self.vr_model_var.get(),
             'aggression_setting': self.aggression_setting_var.get(),
             'window_size': self.window_size_var.get(),
+            'mdx_window_size': self.mdx_window_size_var.get(),
             'batch_size': self.batch_size_var.get(),
             'crop_size': self.crop_size_var.get(),
             'is_tta': self.is_tta_var.get(),
@@ -4967,10 +5389,13 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             'demucs_model': self.demucs_model_var.get(),
             'segment': self.segment_var.get(),
             'overlap': self.overlap_var.get(),
+            'overlap_mdx': self.overlap_mdx_var.get(),
+            'overlap_mdx23': self.overlap_mdx23_var.get(),
             'shifts': self.shifts_var.get(),
             'chunks_demucs': self.chunks_demucs_var.get(),
             'margin_demucs': self.margin_demucs_var.get(),
             'is_chunk_demucs': self.is_chunk_demucs_var.get(),
+            'is_chunk_mdxnet': self.is_chunk_mdxnet_var.get(),
             'is_primary_stem_only_Demucs': self.is_primary_stem_only_Demucs_var.get(),
             'is_secondary_stem_only_Demucs': self.is_secondary_stem_only_Demucs_var.get(),
             'is_split_mode': self.is_split_mode_var.get(),
@@ -4991,8 +5416,11 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             'chunks': self.chunks_var.get(),
             'margin': self.margin_var.get(),
             'compensate': self.compensate_var.get(),
-            'is_denoise': self.is_denoise_var.get(),
-            'is_invert_spec': self.is_invert_spec_var.get(), 
+            'is_denoise': self.is_denoise_var.get(),#is_match_frequency_pitch
+            'is_match_frequency_pitch': self.is_match_frequency_pitch_var.get(),#is_match_frequency_pitch
+            'is_mdx_c_seg_def': self.is_mdx_c_seg_def_var.get(),#
+            'is_invert_spec': self.is_invert_spec_var.get(),
+            'is_mixer_mode': self.is_mixer_mode_var.get(),
             'mdx_batch_size':self.mdx_batch_size_var.get(),
             'mdx_voc_inst_secondary_model': self.mdx_voc_inst_secondary_model_var.get(),
             'mdx_other_secondary_model': self.mdx_other_secondary_model_var.get(),
@@ -5008,17 +5436,20 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             'chosen_audio_tool': self.chosen_audio_tool_var.get(),
             'choose_algorithm': self.choose_algorithm_var.get(),
             'time_stretch_rate': self.time_stretch_rate_var.get(),
-            'pitch_rate': self.pitch_rate_var.get(),
+            'pitch_rate': self.pitch_rate_var.get(),#
+            'is_time_correction': self.is_time_correction_var.get(),#
             'is_gpu_conversion': self.is_gpu_conversion_var.get(),
             'is_primary_stem_only': self.is_primary_stem_only_var.get(),
             'is_secondary_stem_only': self.is_secondary_stem_only_var.get(),
-            'is_testing_audio': self.is_testing_audio_var.get(),
+            'is_testing_audio': self.is_testing_audio_var.get(),#
+            'is_auto_update_model_params': self.is_auto_update_model_params_var.get(),
             'is_add_model_name': self.is_add_model_name_var.get(),
             'is_accept_any_input': self.is_add_model_name_var.get(),
             'is_task_complete': self.is_task_complete_var.get(),
             'is_normalization': self.is_normalization_var.get(),
             'is_create_model_folder': self.is_create_model_folder_var.get(),
             'mp3_bit_set': self.mp3_bit_set_var.get(),
+            'semitone_shift': self.semitone_shift_var.get(),#
             'save_format': self.save_format_var.get(),
             'wav_type_set': self.wav_type_set_var.get(),
             'user_code': self.user_code_var.get(),
@@ -5036,7 +5467,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         }
 
         user_saved_extras = {
-            'demucs_stems': self.demucs_stems_var.get()}
+            'demucs_stems': self.demucs_stems_var.get(),
+            'mdx_stems': self.mdxnet_stems_var.get()}
 
         if app_close:
             save_data(data={**main_settings, **other_data})
@@ -5066,15 +5498,6 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         settings_list = '\n'.join(''.join(f"{key}: {value}") for key, value in settings_dict.items() if not key == 'user_code')
 
         return f"\nFull Application Settings:\n\n{settings_list}"
-        
-def secondary_stem(stem):
-    """Determines secondary stem"""
-    
-    for key, value in STEM_PAIR_MAPPER.items():
-        if stem in key:
-            secondary_stem = value
-    
-    return secondary_stem
 
 def vip_downloads(password, link_type=VIP_REPO):
     """Attempts to decrypt VIP model link with given input code"""
@@ -5085,14 +5508,30 @@ def vip_downloads(password, link_type=VIP_REPO):
             length=32,
             salt=link_type[0],
             iterations=390000,)
-  
-  
+
         key = base64.urlsafe_b64encode(kdf.derive(bytes(password, 'utf-8')))
         f = Fernet(key)
 
         return str(f.decrypt(link_type[1]), 'UTF-8')
     except Exception:
         return NO_CODE
+
+def extract_stems(export_path):
+    
+    filenames = os.listdir(export_path)
+
+    pattern = r'\((.*?)\)\.wav'
+    stem_list = []
+
+    for filename in filenames:
+        match = re.search(pattern, filename)
+        if match:
+            stem_list.append(match.group(1))
+
+    counter = Counter(stem_list)
+    filtered_lst = [item for item in stem_list if counter[item] > 1]
+
+    return list(set(filtered_lst))
 
 if __name__ == "__main__":
 

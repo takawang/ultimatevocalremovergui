@@ -6,12 +6,15 @@ from demucs.model_v2 import auto_load_demucs_model_v2
 from demucs.pretrained import get_model as _gm
 from demucs.utils import apply_model_v1
 from demucs.utils import apply_model_v2
+from lib_v5.tfc_tdf_v3 import TFC_TDF_net, STFT
 from lib_v5 import spec_utils
 from lib_v5.vr_network import nets
 from lib_v5.vr_network import nets_new
 #from lib_v5.vr_network.model_param_init import ModelParameters
 from pathlib import Path
 from gui_data.constants import *
+from gui_data.error_handling import *
+from scipy import signal
 import audioread
 import gzip
 import librosa
@@ -23,6 +26,11 @@ import torch
 import warnings
 import pydub
 import soundfile as sf
+import traceback
+import lib_v5.mdxnet as MdxnetSet
+import math
+from onnx import load
+from onnx2pytorch import ConvertModel
 
 if TYPE_CHECKING:
     from UVR import ModelData
@@ -46,7 +54,20 @@ class SeperateAttributes:
         self.is_4_stem_ensemble = process_data['is_4_stem_ensemble']
         self.list_all_models = process_data['list_all_models']
         self.process_iteration = process_data['process_iteration']
+        self.is_pitch_change = model_data.is_pitch_change
+        self.semitone_shift = model_data.semitone_shift
+        self.is_match_frequency_pitch = model_data.is_match_frequency_pitch
+        self.overlap = model_data.overlap
+        self.overlap_mdx = model_data.overlap_mdx
+        self.overlap_mdx23 = model_data.overlap_mdx23
+        self.is_mdx_combine_stems = model_data.is_mdx_combine_stems
+        self.is_mdx_c = model_data.is_mdx_c
+        self.mdx_c_configs = model_data.mdx_c_configs
+        self.mdxnet_stem_select = model_data.mdxnet_stem_select
+        self.mixer_path = model_data.mixer_path
         self.model_samplerate = model_data.model_samplerate
+        self.model_capacity = model_data.model_capacity
+        self.is_vr_51_model = model_data.is_vr_51_model
         self.is_pre_proc_model = model_data.is_pre_proc_model
         self.is_secondary_model_activated = model_data.is_secondary_model_activated if not self.is_pre_proc_model else False
         self.is_secondary_model = model_data.is_secondary_model if not self.is_pre_proc_model else True
@@ -67,6 +88,7 @@ class SeperateAttributes:
         self.primary_stem = model_data.primary_stem #
         self.secondary_stem = model_data.secondary_stem #
         self.is_invert_spec = model_data.is_invert_spec #
+        self.is_mixer_mode = model_data.is_mixer_mode #
         self.secondary_model_scale = model_data.secondary_model_scale #
         self.is_demucs_pre_proc_model_inst_mix = model_data.is_demucs_pre_proc_model_inst_mix #
         self.primary_source_map = {}
@@ -75,42 +97,46 @@ class SeperateAttributes:
         self.secondary_source = None
         self.secondary_source_primary = None
         self.secondary_source_secondary = None
+        self.main_model_primary_stem_4_stem = main_model_primary_stem_4_stem
+        self.ensemble_primary_stem = model_data.ensemble_primary_stem
+        self.is_gpu = False
 
         if not model_data.process_method == DEMUCS_ARCH_TYPE:
-            if process_data['is_ensemble_master'] and not self.is_4_stem_ensemble:
-                if not model_data.ensemble_primary_stem == self.primary_stem:
-                    self.is_primary_stem_only, self.is_secondary_stem_only = self.is_secondary_stem_only, self.is_primary_stem_only
-            
-            if self.is_secondary_model and not process_data['is_ensemble_master']:
-                if not self.primary_model_primary_stem == self.primary_stem and not main_model_primary_stem_4_stem:
-                    self.is_primary_stem_only, self.is_secondary_stem_only = self.is_secondary_stem_only, self.is_primary_stem_only
-                    
-            if main_model_primary_stem_4_stem:
-                self.is_primary_stem_only = True if main_model_primary_stem_4_stem == self.primary_stem else False
-                self.is_secondary_stem_only = True if not main_model_primary_stem_4_stem == self.primary_stem else False
+            self.check_label_secondary_stem_runs()
 
             if self.is_pre_proc_model:
                 self.is_primary_stem_only = True if self.primary_stem == INST_STEM else False
                 self.is_secondary_stem_only = True if self.secondary_stem == INST_STEM else False
 
         if model_data.process_method == MDX_ARCH_TYPE:
+            self.is_mdx_ckpt = model_data.is_mdx_ckpt
             self.primary_model_name, self.primary_sources = self.cached_source_callback(MDX_ARCH_TYPE, model_name=self.model_basename)
-            self.is_denoise = model_data.is_denoise
-            self.is_mdx_batch_mode = model_data.is_mdx_batch_mode
+            self.is_denoise = model_data.is_denoise#
+            self.is_mdx_c_seg_def = model_data.is_mdx_c_seg_def#
             self.mdx_batch_size = model_data.mdx_batch_size
             self.compensate = model_data.compensate
-            self.dim_f, self.dim_t = model_data.mdx_dim_f_set, 2**model_data.mdx_dim_t_set
+            self.mdx_window_size = model_data.mdx_window_size
+            if not self.is_mdx_c:
+                self.dim_f, self.dim_t = model_data.mdx_dim_f_set, 2**model_data.mdx_dim_t_set
+            else:
+                if not self.is_4_stem_ensemble:
+                    self.primary_stem = model_data.ensemble_primary_stem if process_data['is_ensemble_master'] else model_data.primary_stem
+                    self.secondary_stem = model_data.ensemble_secondary_stem if process_data['is_ensemble_master'] else model_data.secondary_stem
+                self.check_label_secondary_stem_runs()
             self.n_fft = model_data.mdx_n_fft_scale_set
             self.chunks = model_data.chunks
             self.margin = model_data.margin
-            self.hop = 1024
-            self.n_bins = self.n_fft//2+1
-            self.chunk_size = self.hop * (self.dim_t-1)
-            self.window = torch.hann_window(window_length=self.n_fft, periodic=False).to(cpu)
+            self.adjust = 1
             self.dim_c = 4
-            out_c = self.dim_c
-            self.freq_pad = torch.zeros([1, out_c, self.n_bins-self.dim_f, self.dim_t]).to(cpu)
-        
+            self.hop = 1024
+
+            if self.is_gpu_conversion >= 0 and torch.cuda.is_available():
+                self.is_gpu = True
+                self.device, self.run_type = torch.device('cuda:0'), ['CUDAExecutionProvider']
+            else:
+                self.is_gpu = False
+                self.device, self.run_type = torch.device('cpu'), ['CPUExecutionProvider']
+
         if model_data.process_method == DEMUCS_ARCH_TYPE:
             self.demucs_stems = model_data.demucs_stems if not main_process_method in [MDX_ARCH_TYPE, VR_ARCH_TYPE] else None
             self.secondary_model_4_stem = model_data.secondary_model_4_stem
@@ -143,7 +169,6 @@ class SeperateAttributes:
                 
             self.shifts = model_data.shifts
             self.is_split_mode = model_data.is_split_mode if not self.demucs_version == DEMUCS_V4 else True
-            self.overlap = model_data.overlap
             self.primary_model_name, self.primary_sources = self.cached_source_callback(DEMUCS_ARCH_TYPE, model_name=self.model_basename)
 
         if model_data.process_method == VR_ARCH_TYPE:
@@ -154,15 +179,28 @@ class SeperateAttributes:
             self.is_post_process = model_data.is_post_process
             self.is_gpu_conversion = model_data.is_gpu_conversion
             self.batch_size = model_data.batch_size
-            self.crop_size = model_data.crop_size
             self.window_size = model_data.window_size
             self.input_high_end_h = None
             self.post_process_threshold = model_data.post_process_threshold
             self.aggressiveness = {'value': model_data.aggression_setting, 
                                    'split_bin': self.mp.param['band'][1]['crop_stop'], 
                                    'aggr_correction': self.mp.param.get('aggr_correction')}
-
-    def start_inference(self):
+            
+    def check_label_secondary_stem_runs(self):
+        
+        if self.process_data['is_ensemble_master'] and not self.is_4_stem_ensemble:
+            if not self.ensemble_primary_stem == self.primary_stem:
+                self.is_primary_stem_only, self.is_secondary_stem_only = self.is_secondary_stem_only, self.is_primary_stem_only
+        
+        if self.is_secondary_model and not self.process_data['is_ensemble_master']:
+            if not self.primary_model_primary_stem == self.primary_stem and not self.main_model_primary_stem_4_stem:
+                self.is_primary_stem_only, self.is_secondary_stem_only = self.is_secondary_stem_only, self.is_primary_stem_only
+                
+        if self.main_model_primary_stem_4_stem:
+            self.is_primary_stem_only = True if self.main_model_primary_stem_4_stem == self.primary_stem else False
+            self.is_secondary_stem_only = True if not self.main_model_primary_stem_4_stem == self.primary_stem else False
+            
+    def start_inference_console_write(self):
         
         if self.is_secondary_model and not self.is_pre_proc_model:
             self.write_to_console(INFERENCE_STEP_2_SEC(self.process_method, self.model_basename))
@@ -170,7 +208,7 @@ class SeperateAttributes:
         if self.is_pre_proc_model:
             self.write_to_console(INFERENCE_STEP_2_PRE(self.process_method, self.model_basename))
         
-    def running_inference(self, is_no_write=False):
+    def running_inference_console_write(self, is_no_write=False):
         
         self.write_to_console(DONE, base_text='') if not is_no_write else None
         self.set_progress_bar(0.05) if not is_no_write else None
@@ -181,6 +219,15 @@ class SeperateAttributes:
             self.write_to_console(INFERENCE_STEP_1_PRE)
         else:
             self.write_to_console(INFERENCE_STEP_1)
+        
+    def running_inference_progress_bar(self, length, is_match_mix=False):
+        if not is_match_mix:
+            self.progress_value += 1
+
+            if (0.8/length*self.progress_value) >= 0.8:
+                length = self.progress_value + 1
+  
+            self.set_progress_bar(0.1, (0.8/length*self.progress_value))
         
     def load_cached_sources(self, is_4_stem_demucs=False):
         
@@ -224,31 +271,72 @@ class SeperateAttributes:
             self.write_to_console(DONE, base_text='')
             self.set_progress_bar(0.95)
 
+    def run_mixer(self, mix, sources):
+        try:
+            if self.is_mixer_mode and len(sources) == 4:
+                mixer = MdxnetSet.Mixer(self.device, self.mixer_path).eval()
+                with torch.no_grad():
+                    mix = torch.tensor(mix, dtype=torch.float32)
+                    sources_ = torch.tensor(sources).detach()
+                    x = torch.cat([sources_, mix.unsqueeze(0)], 0)
+                    sources_ = mixer(x)
+                final_source = np.array(sources_)
+            else:
+                final_source = sources
+        except Exception as e:
+            error_name = f'{type(e).__name__}'
+            traceback_text = ''.join(traceback.format_tb(e.__traceback__))
+            message = f'{error_name}: "{e}"\n{traceback_text}"'
+            #print('Mixer Failed: ', message)
+            final_source = sources
+            
+        return final_source
+
+    def pitch_fix(self, source, sr_pitched, org_mix, is_demucs=False):
+        semitone_shift = self.semitone_shift
+        source = spec_utils.change_pitch_semitones(source, sr_pitched, semitone_shift=semitone_shift)[0]
+        source = spec_utils.match_array_shapes(source, org_mix)
+        return source
+    
+    def match_frequency_pitch(self, mix, is_demucs=False):
+        source = mix
+        if self.is_match_frequency_pitch and self.is_pitch_change:
+            source, sr_pitched = spec_utils.change_pitch_semitones(mix, 44100, semitone_shift=-self.semitone_shift)
+            source = self.pitch_fix(source, sr_pitched, mix, is_demucs=is_demucs)
+
+        return source
+
 class SeperateMDX(SeperateAttributes):        
 
     def seperate(self):
-
         samplerate = 44100
-                 
+
         if self.primary_model_name == self.model_basename and self.primary_sources:
             self.primary_source, self.secondary_source = self.load_cached_sources()
         else:
-            self.start_inference()
+            self.start_inference_console_write()
 
-            if self.is_gpu_conversion >= 0:
-                self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')  
-                run_type = ['CUDAExecutionProvider'] if torch.cuda.is_available() else ['CPUExecutionProvider']
+            if self.is_mdx_ckpt:
+                model_params = torch.load(self.model_path, map_location=lambda storage, loc: storage)['hyper_parameters']
+                self.dim_c, self.hop = model_params['dim_c'], model_params['hop_length']
+                separator = MdxnetSet.ConvTDFNet(**model_params)
+                self.model_run = separator.load_from_checkpoint(self.model_path).to(self.device).eval()
             else:
-                self.device = torch.device('cpu')
-                run_type = ['CPUExecutionProvider']
+                if self.mdx_window_size == self.dim_t:
+                    ort_ = ort.InferenceSession(self.model_path, providers=self.run_type)
+                    self.model_run = lambda spek:ort_.run(None, {'input': spek.cpu().numpy()})[0]
+                else:
+                    self.model_run = ConvertModel(load(self.model_path))
+                    self.model_run.to(self.device).eval()
 
-            self.onnx_model = ort.InferenceSession(self.model_path, providers=run_type)
-
-            self.running_inference()
-            mdx_net_cut = True if self.primary_stem in MDX_NET_FREQ_CUT else False
-            mix, raw_mix, samplerate = prepare_mix(self.audio_file, self.chunks, self.margin, mdx_net_cut=mdx_net_cut)
+            self.initialize_model_settings()
+            self.running_inference_console_write()
+            self.stft = STFT(self.n_fft, self.hop, self.dim_f)
+            mdx_net_cut = True if self.primary_stem in MDX_NET_FREQ_CUT and self.is_match_frequency_pitch else False
             
-            source = self.demix_base_batch(mix[0]) if self.is_mdx_batch_mode else self.demix_base(mix)[0]
+            mix = prepare_mix(self.audio_file)
+            source = self.demix(mix)
+            
             self.write_to_console(DONE, base_text='')            
 
         if self.is_secondary_model_activated:
@@ -259,7 +347,7 @@ class SeperateMDX(SeperateAttributes):
             self.write_to_console(f'{SAVING_STEM[0]}{self.primary_stem}{SAVING_STEM[1]}') if not self.is_secondary_model else None
             primary_stem_path = os.path.join(self.export_path, f'{self.audio_file_base}_({self.primary_stem}).wav')
             if not isinstance(self.primary_source, np.ndarray):
-                self.primary_source = spec_utils.normalize(source, self.is_normalization).T
+                self.primary_source = spec_utils.normalize(source*self.compensate, self.is_normalization).T
             self.primary_source_map = {self.primary_stem: self.primary_source}
             self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary)
 
@@ -267,19 +355,19 @@ class SeperateMDX(SeperateAttributes):
             self.write_to_console(f'{SAVING_STEM[0]}{self.secondary_stem}{SAVING_STEM[1]}') if not self.is_secondary_model else None
             secondary_stem_path = os.path.join(self.export_path, f'{self.audio_file_base}_({self.secondary_stem}).wav')
             if not isinstance(self.secondary_source, np.ndarray):
-                raw_mix = self.demix_base(raw_mix, is_match_mix=True)[0] if mdx_net_cut else raw_mix
+                raw_mix = self.demix(self.match_frequency_pitch(mix), is_match_mix=True) if mdx_net_cut else self.match_frequency_pitch(mix)
                 self.secondary_source, raw_mix = spec_utils.normalize_two_stem(source*self.compensate, raw_mix, self.is_normalization)
             
                 if self.is_invert_spec:
                     self.secondary_source = spec_utils.invert_stem(raw_mix, self.secondary_source)
                 else:
+                    #print(self.secondary_source.shape, raw_mix.shape)
                     self.secondary_source = (-self.secondary_source.T+raw_mix.T)
 
             self.secondary_source_map = {self.secondary_stem: self.secondary_source}
             self.write_audio(secondary_stem_path, self.secondary_source, samplerate, self.secondary_source_secondary)
 
         torch.cuda.empty_cache()
-
         secondary_sources = {**self.primary_source_map, **self.secondary_source_map}
 
         self.cache_source(secondary_sources)
@@ -287,122 +375,258 @@ class SeperateMDX(SeperateAttributes):
         if self.is_secondary_model:
             return secondary_sources
 
-    def demix_base_batch(self, mix):
-        
-        mix_waves = []
-        tar_signals = []
-        
-        n_sample = mix.shape[1]
-        trim = self.n_fft//2
-        gen_size = self.chunk_size-2*trim
-        pad = gen_size - n_sample%gen_size
-        mix_p = np.concatenate((np.zeros((2,trim)), mix, np.zeros((2,pad)), np.zeros((2,trim))), 1)
-        i = 0
-        
-        while i < n_sample + pad:
-            waves = np.array(mix_p[:, i:i+self.chunk_size])
-            mix_waves.append(waves)
-            i += gen_size
-        mix_waves_batched = torch.tensor(mix_waves, dtype=torch.float32).split(self.mdx_batch_size)
-        with torch.no_grad():
-            _ort = self.onnx_model
-            adjust = 1
-            for mix_wave in mix_waves_batched:
-                self.progress_value += 1
-                self.set_progress_bar(0.1, (0.8/len(mix_waves_batched)*self.progress_value))
-                spek = self.stft(mix_wave)*adjust
-                spek[:, :, :3, :] *= 0 
-                
-                if self.is_denoise:
-                    spec_pred = -_ort.run(None, {'input': -spek.numpy()})[0]*0.5+_ort.run(None, {'input': spek.numpy()})[0]*0.5
-                else:
-                    spec_pred = _ort.run(None, {'input': spek.numpy()})[0]
+    def initialize_model_settings(self):
+        self.n_bins = self.n_fft//2+1
+        self.trim = self.n_fft//2
+        self.chunk_size = self.hop * (self.mdx_window_size-1)
+        self.gen_size = self.chunk_size-2*self.trim
 
-                tar_waves = self.istft(torch.tensor(spec_pred))
-                tar_signals.append(tar_waves[:, :, trim:-trim].transpose(0, 1).reshape(2, -1).numpy())
-            source = np.concatenate(tar_signals, axis=-1)[:, :-pad]
+    def demix(self, mix, is_match_mix=False):
 
-        del self.onnx_model
+        org_mix = mix
+        tar_waves_ = []
+
+        if is_match_mix:
+            chunk_size = self.hop * (256-1)
+            overlap = 0.02
+        else:
+            chunk_size = self.chunk_size
+            overlap = self.overlap_mdx
+            
+            if self.is_pitch_change:
+                mix, sr_pitched = spec_utils.change_pitch_semitones(mix, 44100, semitone_shift=-self.semitone_shift)
+
+        gen_size = chunk_size-2*self.trim
+
+        pad = gen_size + self.trim - ((mix.shape[-1]) % gen_size)
+        mixture = np.concatenate((np.zeros((2, self.trim), dtype='float32'), mix, np.zeros((2, pad), dtype='float32')), 1)
+
+        step = self.chunk_size - self.n_fft if overlap == DEFAULT else int((1 - overlap) * chunk_size)
+        result = np.zeros((1, 2, mixture.shape[-1]), dtype=np.float32)
+        divider = np.zeros((1, 2, mixture.shape[-1]), dtype=np.float32)
+        total = 0
+        total_chunks = (mixture.shape[-1] + step - 1) // step
+
+        for i in range(0, mixture.shape[-1], step):
+            total += 1
+            start = i
+            end = min(i + chunk_size, mixture.shape[-1])
+
+            chunk_size_actual = end - start
+
+            if overlap == 0:
+                window = None
+            else:
+                window = np.hanning(chunk_size_actual)
+                window = np.tile(window[None, None, :], (1, 2, 1))
+
+            if end != i + chunk_size:
+                pad_size = (i + chunk_size) - end
+                mix_part = [np.concatenate((mixture[:, start:end], np.zeros((2, pad_size), dtype='float32')), axis=-1)]
+            else:
+                mix_part = [mixture[:, start:end]]
+
+            mix_part = torch.tensor(mix_part, dtype=torch.float32).to(self.device)
+            mix_waves = mix_part.split(self.mdx_batch_size)
+
+            with torch.no_grad():
+                for mix_wave in mix_waves:
+                    self.running_inference_progress_bar(total_chunks, is_match_mix=is_match_mix)
+
+                    tar_waves = self.run_model(mix_wave, is_match_mix=is_match_mix)
+
+                    if window is not None:
+                        tar_waves[..., :chunk_size_actual] *= window 
+                        divider[..., start:end] += window
+                    else:
+                        divider[..., start:end] += 1
+
+                    result[..., start:end] += tar_waves[..., :end-start]
+
+        tar_waves = result / divider
+        tar_waves_.append(tar_waves)
+
+        tar_waves_ = np.vstack(tar_waves_)[:, :, self.trim:-self.trim]
+        tar_waves = np.concatenate(tar_waves_, axis=-1)[:, :mix.shape[-1]]
+        
+        source = tar_waves[:,0:None]
+
+        if self.is_pitch_change and not is_match_mix:
+            source = self.pitch_fix(source, sr_pitched, org_mix)
 
         return source
 
-    def demix_base(self, mix, is_match_mix=False):
-        chunked_sources = []
+    def run_model(self, mix, is_match_mix=False):
+        
+        spek = self.stft(mix.to(self.device))*self.adjust
+        spek[:, :, :3, :] *= 0 
 
-        for slice in mix:
-            self.progress_value += 1
-            self.set_progress_bar(0.1, (0.8/len(mix)*self.progress_value)) if not is_match_mix else None
-            cmix = mix[slice]
-            sources = []
-            mix_waves = []
-            n_sample = cmix.shape[1]
-            trim = self.n_fft//2
-            gen_size = self.chunk_size-2*trim
-            pad = gen_size - n_sample%gen_size
-            mix_p = np.concatenate((np.zeros((2,trim)), cmix, np.zeros((2,pad)), np.zeros((2,trim))), 1)
-            i = 0
-            while i < n_sample + pad:
-                waves = np.array(mix_p[:, i:i+self.chunk_size])
-                mix_waves.append(waves)
-                i += gen_size
-            mix_waves = torch.tensor(mix_waves, dtype=torch.float32).to(cpu)
-            with torch.no_grad():
-                _ort = self.onnx_model if not is_match_mix else None
-                adjust = 1
-                spek = self.stft(mix_waves)*adjust
-                spek[:, :, :3, :] *= 0 
-                
-                if not is_match_mix:
-                    if self.is_denoise:
-                        spec_pred = -_ort.run(None, {'input': -spek.cpu().numpy()})[0]*0.5+_ort.run(None, {'input': spek.cpu().numpy()})[0]*0.5
+        if is_match_mix:
+            spec_pred = spek.cpu().numpy()
+        else:
+            spec_pred = -self.model_run(-spek)*0.5+self.model_run(spek)*0.5 if self.is_denoise else self.model_run(spek)
+
+        return self.stft.inverse(torch.tensor(spec_pred).to(self.device)).cpu().detach().numpy()
+
+class SeperateMDXC(SeperateAttributes):        
+
+    def seperate(self):
+
+        samplerate = 44100
+
+        if self.primary_model_name == self.model_basename and self.primary_sources:
+            self.primary_source, self.secondary_source = self.load_cached_sources()
+        else:
+            self.start_inference_console_write()
+            self.running_inference_console_write()
+            mix = prepare_mix(self.audio_file)
+            
+            sources = self.demix(mix)
+            self.write_to_console(DONE, base_text='')            
+
+        if self.is_secondary_model_activated:
+            if self.secondary_model:
+                self.secondary_source_primary, self.secondary_source_secondary = process_secondary_model(self.secondary_model, self.process_data, main_process_method=self.process_method)
+
+        stem_list = [self.mdx_c_configs.training.target_instrument] if self.mdx_c_configs.training.target_instrument else [i for i in self.mdx_c_configs.training.instruments]
+        
+        if self.is_secondary_model:
+            self.mdxnet_stem_select = self.main_model_primary_stem_4_stem if self.main_model_primary_stem_4_stem else self.primary_model_primary_stem
+            self.primary_stem = self.mdxnet_stem_select
+            self.secondary_stem = secondary_stem(self.mdxnet_stem_select)
+            self.is_primary_stem_only, self.is_secondary_stem_only = False, False
+
+        if (self.mdxnet_stem_select == ALL_STEMS and not self.process_data['is_ensemble_master'] and not len(stem_list) == 1 and not self.is_secondary_model) or self.is_4_stem_ensemble and not len(stem_list) == 1:
+            for stem in stem_list:
+                self.write_to_console(f'{SAVING_STEM[0]}{stem}{SAVING_STEM[1]}') if not self.is_secondary_model else None
+                primary_stem_path = os.path.join(self.export_path, f'{self.audio_file_base}_({stem}).wav')
+                self.primary_source = spec_utils.normalize(sources[stem], self.is_normalization).T
+                self.primary_source_map = {self.primary_stem: self.primary_source}
+                self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary)
+        else:
+            source_primary = sources if len(stem_list) == 1 else sources[self.mdxnet_stem_select]
+
+            if not self.is_secondary_stem_only:
+                self.write_to_console(f'{SAVING_STEM[0]}{self.primary_stem}{SAVING_STEM[1]}') if not self.is_secondary_model else None
+                primary_stem_path = os.path.join(self.export_path, f'{self.audio_file_base}_({self.primary_stem}).wav')
+                if not isinstance(self.primary_source, np.ndarray):
+                    self.primary_source = spec_utils.normalize(source_primary, self.is_normalization).T
+
+                self.primary_source_map = {self.primary_stem: self.primary_source}
+                self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary)
+
+            if not self.is_primary_stem_only:
+                self.write_to_console(f'{SAVING_STEM[0]}{self.secondary_stem}{SAVING_STEM[1]}') if not self.is_secondary_model else None
+                secondary_stem_path = os.path.join(self.export_path, f'{self.audio_file_base}_({self.secondary_stem}).wav')
+                if not isinstance(self.secondary_source, np.ndarray):
+                    
+                    if self.is_mdx_combine_stems and len(stem_list) >= 2:
+                        if len(stem_list) == 2:
+                            secondary_source = sources[self.secondary_stem]
+                        else:
+                            sources.pop(self.primary_stem)
+                            next_stem = next(iter(sources))
+                            secondary_source = np.zeros_like(sources[next_stem])
+                            for v in sources.values():
+                                secondary_source += v
+                                
+                        self.secondary_source = spec_utils.normalize(secondary_source, self.is_normalization).T 
                     else:
-                        spec_pred = _ort.run(None, {'input': spek.cpu().numpy()})[0]
-                else:
-                    spec_pred = spek.cpu().numpy()
+                        #raw_mix = self.demix(mix, is_match_mix=True)[0] if mdx_net_cut else raw_mix
+                        self.secondary_source, raw_mix = spec_utils.normalize_two_stem(source_primary, self.match_frequency_pitch(mix), self.is_normalization)
+                        self.secondary_source = spec_utils.to_shape(self.secondary_source, raw_mix.shape)
+                    
+                        if self.is_invert_spec:
+                            self.secondary_source = spec_utils.invert_stem(raw_mix, self.secondary_source)
+                        else:
+                            self.secondary_source = (-self.secondary_source.T+raw_mix.T)
+                            
+                self.secondary_source_map = {self.secondary_stem: self.secondary_source}
+                self.write_audio(secondary_stem_path, self.secondary_source, samplerate, self.secondary_source_secondary)
 
-                tar_waves = self.istft(torch.tensor(spec_pred))#.cpu()
-                tar_signal = tar_waves[:,:,trim:-trim].transpose(0,1).reshape(2, -1).numpy()[:, :-pad]
-                start = 0 if slice == 0 else self.margin
-                end = None if slice == list(mix.keys())[::-1][0] else -self.margin
-                if self.margin == 0:
-                    end = None
-                sources.append(tar_signal[:,start:end]*(1/adjust))
-            chunked_sources.append(sources)
-        sources = np.concatenate(chunked_sources, axis=-1)
+        torch.cuda.empty_cache()
+        secondary_sources = {**self.primary_source_map, **self.secondary_source_map}
 
-        if not is_match_mix:
-            del self.onnx_model
+        self.cache_source(secondary_sources)
 
-        return sources
-    
-    def stft(self, x):
-        x = x.reshape([-1, self.chunk_size])
-        x = torch.stft(x, n_fft=self.n_fft, hop_length=self.hop, window=self.window, center=True)
-        x = x.permute([0,3,1,2])
-        x = x.reshape([-1,2,2,self.n_bins,self.dim_t]).reshape([-1,self.dim_c,self.n_bins,self.dim_t])
-        return x[:,:,:self.dim_f]
+        if self.is_secondary_model:
+            return secondary_sources
 
-    def istft(self, x, freq_pad=None):
-        freq_pad = self.freq_pad.repeat([x.shape[0],1,1,1]) if freq_pad is None else freq_pad
-        x = torch.cat([x, freq_pad], -2)
-        c = 2
-        x = x.reshape([-1,c,2,self.n_bins,self.dim_t]).reshape([-1,2,self.n_bins,self.dim_t])
-        x = x.permute([0,2,3,1])
-        x = torch.istft(x, n_fft=self.n_fft, hop_length=self.hop, window=self.window, center=True)
-        return x.reshape([-1,c,self.chunk_size])
+    def demix(self, mix):
+        sr_pitched = 441000
+        org_mix = mix
+        if self.is_pitch_change:
+            mix, sr_pitched = spec_utils.change_pitch_semitones(mix, 44100, semitone_shift=-self.semitone_shift)
+        
+        model = TFC_TDF_net(self.mdx_c_configs).eval().to(self.device)
+        model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+        
+        mix = torch.tensor(mix, dtype=torch.float32)
+
+        try:
+            S = model.num_target_instruments
+        except Exception as e:
+            S = model.module.num_target_instruments
+
+        mdx_window_size = self.mdx_c_configs.inference.dim_t if self.is_mdx_c_seg_def else self.mdx_window_size
+        
+        batch_size = self.mdx_batch_size
+        C = self.mdx_c_configs.audio.hop_length * (mdx_window_size - 1)
+        N = self.overlap_mdx23
+
+        H = C // N
+        L = mix.shape[1]
+        pad_size = H - (L - C) % H
+        mix = torch.cat([torch.zeros(2, C - H), mix, torch.zeros(2, pad_size + C - H)], 1)
+        mix = mix.to(self.device)
+
+        chunks = []
+        i = 0
+        while i + C <= mix.shape[1]:
+            chunks.append(mix[:, i:i + C])
+            i += H
+        chunks = torch.stack(chunks)
+
+        batches = []
+        i = 0
+        while i < len(chunks):
+            batches.append(chunks[i:i + batch_size])
+            i = i + batch_size
+
+        X = torch.zeros(S, 2, C - H) if S > 1 else torch.zeros(2, C - H)
+        X = X.to(self.device)
+
+        with torch.cuda.amp.autocast():
+            with torch.no_grad():
+                for batch in batches:
+                    self.running_inference_progress_bar(len(batches))
+                    x = model(batch)
+                    for w in x:
+                        a = X[..., :-(C - H)]
+                        b = X[..., -(C - H):] + w[..., :(C - H)]
+                        c = w[..., (C - H):]
+                        X = torch.cat([a, b, c], -1)
+
+        estimated_sources = X[..., C - H:-(pad_size + C - H)] / N
+
+
+        pitch_fix = lambda s:self.pitch_fix(s, sr_pitched, org_mix)
+
+        if S > 1:
+            return {k: pitch_fix(v) if self.is_pitch_change else v for k, v in zip(self.mdx_c_configs.training.instruments, estimated_sources.cpu().numpy())}
+        else:
+            est_s = estimated_sources.cpu().numpy()
+            return pitch_fix(est_s) if self.is_pitch_change else est_s
 
 class SeperateDemucs(SeperateAttributes):        
 
     def seperate(self):
-
         samplerate = 44100
         source = None
         model_scale = None
         stem_source = None
         stem_source_secondary = None
         inst_mix = None
-        inst_raw_mix = None
-        raw_mix = None
         inst_source = None
         is_no_write = False
         is_no_piano_guitar = False
@@ -413,7 +637,7 @@ class SeperateDemucs(SeperateAttributes):
             source = self.primary_sources
             self.load_cached_sources(is_4_stem_demucs=True)
         else:
-            self.start_inference()
+            self.start_inference_console_write()
 
             if self.is_gpu_conversion >= 0:
                 self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu') 
@@ -445,24 +669,27 @@ class SeperateDemucs(SeperateAttributes):
                     is_no_write = True
                     self.write_to_console(DONE, base_text='')
                     mix_no_voc = process_secondary_model(self.pre_proc_model, self.process_data, is_pre_proc_model=True)
-                    inst_mix, inst_raw_mix, inst_samplerate = prepare_mix(mix_no_voc[INST_STEM], self.chunks_demucs, self.margin_demucs)
+                    inst_mix = prepare_mix(mix_no_voc[INST_STEM])
                     self.process_iteration()
-                    self.running_inference(is_no_write=is_no_write)
+                    self.running_inference_console_write(is_no_write=is_no_write)
                     inst_source = self.demix_demucs(inst_mix)
+                    inst_source = self.run_mixer(inst_mix, inst_source)
                     self.process_iteration()
 
-            self.running_inference(is_no_write=is_no_write) if not self.pre_proc_model else None
-            mix, raw_mix, samplerate = prepare_mix(self.audio_file, self.chunks_demucs, self.margin_demucs)
+            self.running_inference_console_write(is_no_write=is_no_write) if not self.pre_proc_model else None
+            mix = prepare_mix(self.audio_file)
             
             if self.primary_model_name == self.model_basename and isinstance(self.primary_sources, np.ndarray) and self.pre_proc_model:
                 source = self.primary_sources
             else:
                 source = self.demix_demucs(mix)
+                source = self.run_mixer(mix, source)
             
             self.write_to_console(DONE, base_text='')
             
             del self.demucs
-
+            torch.cuda.empty_cache()
+            
         if isinstance(inst_source, np.ndarray):
             source_reshape = spec_utils.reshape_sources(inst_source[self.demucs_source_map[VOCAL_STEM]], source[self.demucs_source_map[VOCAL_STEM]])
             inst_source[self.demucs_source_map[VOCAL_STEM]] = source_reshape
@@ -473,6 +700,7 @@ class SeperateDemucs(SeperateAttributes):
                 self.demucs_source_map = DEMUCS_2_SOURCE_MAPPER
             else:
                 self.demucs_source_map = DEMUCS_6_SOURCE_MAPPER if len(source) == 6 else DEMUCS_4_SOURCE_MAPPER
+
                 if len(source) == 6 and self.process_data['is_ensemble_master'] or len(source) == 6 and self.is_secondary_model:
                     is_no_piano_guitar = True
                     six_stem_other_source = list(source)
@@ -487,11 +715,11 @@ class SeperateDemucs(SeperateAttributes):
             self.cache_source(source)
             
             for stem_name, stem_value in self.demucs_source_map.items():
-
                 if self.is_secondary_model_activated and not self.is_secondary_model and not stem_value >= 4:
                     if self.secondary_model_4_stem[stem_value]:
                         model_scale = self.secondary_model_4_stem_scale[stem_value]
                         stem_source_secondary = process_secondary_model(self.secondary_model_4_stem[stem_value], self.process_data, main_model_primary_stem_4_stem=stem_name, is_4_stem_demucs=True)
+                        print(stem_source_secondary)
                         if isinstance(stem_source_secondary, np.ndarray):
                             stem_source_secondary = stem_source_secondary[1 if self.secondary_model_4_stem[stem_value].demucs_stem_count == 2 else stem_value]
                             stem_source_secondary = spec_utils.normalize(stem_source_secondary, self.is_normalization).T
@@ -541,7 +769,7 @@ class SeperateDemucs(SeperateAttributes):
                             secondary_source = spec_utils.normalize(secondary_source, self.is_normalization).T
                         else:
                             if not isinstance(raw_mixture, np.ndarray):
-                                raw_mixture = prepare_mix(self.audio_file, self.chunks_demucs, self.margin_demucs, is_missing_mix=True)
+                                raw_mixture = prepare_mix(self.audio_file)
        
                             secondary_source, raw_mixture = spec_utils.normalize_two_stem(source[self.demucs_source_map[self.primary_stem]], raw_mixture, self.is_normalization)
                             
@@ -558,13 +786,11 @@ class SeperateDemucs(SeperateAttributes):
 
                     self.write_audio(secondary_stem_path, secondary_source, samplerate, secondary_source_secondary)
 
-                secondary_save(self.secondary_stem, source, raw_mixture=raw_mix)
+                secondary_save(self.secondary_stem, source, raw_mixture=mix)
                 
                 if self.is_demucs_pre_proc_model_inst_mix and self.pre_proc_model and not self.is_4_stem_ensemble:
-                    secondary_save(f"{self.secondary_stem} {INST_STEM}", source, raw_mixture=inst_raw_mix, is_inst_mixture=True)
-                
-            torch.cuda.empty_cache()
-                
+                    secondary_save(f"{self.secondary_stem} {INST_STEM}", source, raw_mixture=inst_mix, is_inst_mixture=True)
+
             secondary_sources = {**self.primary_source_map, **self.secondary_source_map}
 
             self.cache_source(secondary_sources)
@@ -573,63 +799,62 @@ class SeperateDemucs(SeperateAttributes):
                 return secondary_sources
     
     def demix_demucs(self, mix):
+        
+        org_mix = mix
+        
+        if self.is_pitch_change:
+            mix, sr_pitched = spec_utils.change_pitch_semitones(mix, 44100, semitone_shift=-self.semitone_shift)
+        
         processed = {}
-
-        set_progress_bar = None if self.is_chunk_demucs else self.set_progress_bar
-
-        for nmix in mix:
-            self.progress_value += 1
-            self.set_progress_bar(0.1, (0.8/len(mix)*self.progress_value)) if self.is_chunk_demucs else None
-            cmix = mix[nmix]
-            cmix = torch.tensor(cmix, dtype=torch.float32)
-            ref = cmix.mean(0)        
-            cmix = (cmix - ref.mean()) / ref.std()
-            mix_infer = cmix 
-            
-            with torch.no_grad():
-                if self.demucs_version == DEMUCS_V1:
-                    sources = apply_model_v1(self.demucs, 
-                                                mix_infer.to(self.device), 
-                                                self.shifts, 
-                                                self.is_split_mode,
-                                                set_progress_bar=set_progress_bar)
-                elif self.demucs_version == DEMUCS_V2:
-                    sources = apply_model_v2(self.demucs, 
-                                                mix_infer.to(self.device), 
-                                                self.shifts,
-                                                self.is_split_mode,
-                                                self.overlap,
-                                                set_progress_bar=set_progress_bar)
-                else:
-                    sources = apply_model(self.demucs, 
-                                            mix_infer[None], 
+        mix = torch.tensor(mix, dtype=torch.float32)
+        ref = mix.mean(0)        
+        mix = (mix - ref.mean()) / ref.std()
+        mix_infer = mix 
+        
+        with torch.no_grad():
+            if self.demucs_version == DEMUCS_V1:
+                sources = apply_model_v1(self.demucs, 
+                                            mix_infer.to(self.device), 
+                                            self.shifts, 
+                                            self.is_split_mode,
+                                            set_progress_bar=self.set_progress_bar)
+            elif self.demucs_version == DEMUCS_V2:
+                sources = apply_model_v2(self.demucs, 
+                                            mix_infer.to(self.device), 
                                             self.shifts,
                                             self.is_split_mode,
                                             self.overlap,
-                                            static_shifts=1 if self.shifts == 0 else self.shifts,
-                                            set_progress_bar=set_progress_bar,
-                                            device=self.device)[0]
-            
-            sources = (sources * ref.std() + ref.mean()).cpu().numpy()
-            sources[[0,1]] = sources[[1,0]]
-            start = 0 if nmix == 0 else self.margin_demucs
-            end = None if nmix == list(mix.keys())[::-1][0] else -self.margin_demucs
-            if self.margin_demucs == 0:
-                end = None
-            processed[nmix] = sources[:,:,start:end].copy()
-            sources = list(processed.values())
+                                            set_progress_bar=self.set_progress_bar)
+            else:
+                sources = apply_model(self.demucs, 
+                                        mix_infer[None], 
+                                        self.shifts,
+                                        self.is_split_mode,
+                                        self.overlap,
+                                        static_shifts=1 if self.shifts == 0 else self.shifts,
+                                        set_progress_bar=self.set_progress_bar,
+                                        device=self.device)[0]
+        
+        sources = (sources * ref.std() + ref.mean()).cpu().numpy()
+        sources[[0,1]] = sources[[1,0]]
+        processed[mix] = sources[:,:,0:None].copy()
+        sources = list(processed.values())
+        sources = [s[:,:,0:None] for s in sources]
+        #sources = [self.pitch_fix(s[:,:,0:None], sr_pitched, org_mix) if self.is_pitch_change else s[:,:,0:None] for s in sources]
         sources = np.concatenate(sources, axis=-1)
+                     
+        if self.is_pitch_change:
+            sources = [self.pitch_fix(stem, sr_pitched, org_mix, is_demucs=True) for stem in sources]
                         
         return sources
 
 class SeperateVR(SeperateAttributes):        
 
     def seperate(self):
-
         if self.primary_model_name == self.model_basename and self.primary_sources:
             self.primary_source, self.secondary_source = self.load_cached_sources()
         else:
-            self.start_inference()
+            self.start_inference_console_write()
             if self.is_gpu_conversion >= 0:
                 if OPERATING_SYSTEM == 'Darwin':
                     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
@@ -637,32 +862,29 @@ class SeperateVR(SeperateAttributes):
                     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu') 
             else:
                 device = torch.device('cpu')
-            
+
             nn_arch_sizes = [
                 31191, # default
-                33966, 56817, 218409, 123821, 123812, 129605, 537238, 537227]
+                33966, 56817, 123821, 123812, 129605, 218409, 537238, 537227]
             vr_5_1_models = [56817, 218409]
-            
             model_size = math.ceil(os.stat(self.model_path).st_size / 1024)
-            nn_architecture = min(nn_arch_sizes, key=lambda x:abs(x-model_size))
+            nn_arch_size = min(nn_arch_sizes, key=lambda x:abs(x-model_size))
 
-            if nn_architecture in vr_5_1_models:
-                model = nets_new.CascadedNet(self.mp.param['bins'] * 2, nn_architecture)
-                inference = self.inference_vr_new
+            if nn_arch_size in vr_5_1_models or self.is_vr_51_model:
+                self.model_run = nets_new.CascadedNet(self.mp.param['bins'] * 2, nn_arch_size, nout=self.model_capacity[0], nout_lstm=self.model_capacity[1])
+                print('51')
             else:
-                model = nets.determine_model_capacity(self.mp.param['bins'] * 2, nn_architecture)
-                inference = self.inference_vr
+                self.model_run = nets.determine_model_capacity(self.mp.param['bins'] * 2, nn_arch_size)
+                print('40')
+                            
+            self.model_run.load_state_dict(torch.load(self.model_path, map_location=cpu)) 
+            self.model_run.to(device) 
 
-            model.load_state_dict(torch.load(self.model_path, map_location=device)) 
-            model.to(device) 
-            
-            self.running_inference()
-            
-            y_spec, v_spec = inference(self.loading_mix(), device, model, self.aggressiveness)
+            self.running_inference_console_write()
+                        
+            y_spec, v_spec = self.inference_vr(self.loading_mix(), device, self.aggressiveness)
             self.write_to_console(DONE, base_text='')
             
-            del model
-
         if self.is_secondary_model_activated:
             if self.secondary_model:
                 self.secondary_source_primary, self.secondary_source_secondary = process_secondary_model(self.secondary_model, self.process_data, main_process_method=self.process_method)
@@ -691,9 +913,8 @@ class SeperateVR(SeperateAttributes):
             self.secondary_source_map = {self.secondary_stem: self.secondary_source}
             
             self.write_audio(secondary_stem_path, self.secondary_source, 44100, self.secondary_source_secondary)
-
+            
         torch.cuda.empty_cache()
-        
         secondary_sources = {**self.primary_source_map, **self.secondary_source_map}
         self.cache_source(secondary_sources)
 
@@ -712,7 +933,7 @@ class SeperateVR(SeperateAttributes):
             if OPERATING_SYSTEM == 'Darwin':
                 wav_resolution = 'polyphase' if SYSTEM_PROC == ARM or ARM in SYSTEM_ARCH else bp['res_type']
             else:
-                wav_resolution = bp['res_type']
+                wav_resolution = 'polyphase'#bp['res_type']
         
             if d == bands_n: # high-end band
                 X_wave[d], _ = librosa.load(self.audio_file, bp['sr'], False, dtype=np.float32, res_type=wav_resolution)
@@ -738,80 +959,20 @@ class SeperateVR(SeperateAttributes):
 
         return X_spec
 
-    def inference_vr(self, X_spec, device, model, aggressiveness):
-        
-        def _execute(X_mag_pad, roi_size, n_window, device, model, aggressiveness):
-            model.eval()
-            
-            total_iterations = sum([n_window]) if not self.is_tta else sum([n_window])*2
-            
-            with torch.no_grad():
-                preds = []
-
-                for i in range(n_window):
-                    self.progress_value +=1
-                    self.set_progress_bar(0.1, 0.8/total_iterations*self.progress_value)
-                    start = i * roi_size
-                    X_mag_window = X_mag_pad[None, :, :, start:start + self.window_size]
-                    X_mag_window = torch.from_numpy(X_mag_window).to(device)
-                    pred = model.predict(X_mag_window, aggressiveness)
-                    pred = pred.detach().cpu().numpy()
-                    preds.append(pred[0])
-                    
-                pred = np.concatenate(preds, axis=2)
-            return pred
-
-        X_mag, X_phase = spec_utils.preprocess(X_spec)
-        coef = X_mag.max()
-        X_mag_pre = X_mag / coef
-        n_frame = X_mag_pre.shape[2]
-        pad_l, pad_r, roi_size = spec_utils.make_padding(n_frame, self.window_size, model.offset)
-        n_window = int(np.ceil(n_frame / roi_size))
-        X_mag_pad = np.pad(
-            X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
-        pred = _execute(X_mag_pad, roi_size, n_window, device, model, aggressiveness)
-        pred = pred[:, :, :n_frame]
-        
-        if self.is_tta:
-            pad_l += roi_size // 2
-            pad_r += roi_size // 2
-            n_window += 1
-            X_mag_pad = np.pad(X_mag_pre, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
-            pred_tta = _execute(X_mag_pad, roi_size, n_window, device, model, aggressiveness)
-            pred_tta = pred_tta[:, :, roi_size // 2:]
-            pred_tta = pred_tta[:, :, :n_frame]
-            pred, X_mag, X_phase = (pred + pred_tta) * 0.5 * coef, X_mag, np.exp(1.j * X_phase)
-        else:
-            pred, X_mag, X_phase = pred * coef, X_mag, np.exp(1.j * X_phase)
-                   
-        if self.is_post_process:
-            pred_inv = np.clip(X_mag - pred, 0, np.inf)
-            pred = spec_utils.mask_silence(pred, pred_inv, thres=self.post_process_threshold)
-            
-        y_spec = pred * X_phase
-        v_spec = X_spec - y_spec
-        
-        return y_spec, v_spec
-
-    def inference_vr_new(self, X_spec, device, model, aggressiveness):
-        
+    def inference_vr(self, X_spec, device, aggressiveness):
         def _execute(X_mag_pad, roi_size):
-            
             X_dataset = []
-            patches = (X_mag_pad.shape[2] - 2 * model.offset) // roi_size
+            patches = (X_mag_pad.shape[2] - 2 * self.model_run.offset) // roi_size
             total_iterations = patches//self.batch_size if not self.is_tta else (patches//self.batch_size)*2
-            
             for i in range(patches):
                 start = i * roi_size
-                X_mag_crop = X_mag_pad[:, :, start:start + self.crop_size]
-                X_dataset.append(X_mag_crop)
+                X_mag_window = X_mag_pad[:, :, start:start + self.window_size]
+                X_dataset.append(X_mag_window)
 
             X_dataset = np.asarray(X_dataset)
-            model.eval()
-            
+            self.model_run.eval()
             with torch.no_grad():
                 mask = []
-                # To reduce the overhead, dataloader is not used.
                 for i in range(0, patches, self.batch_size):
                     self.progress_value += 1
                     if self.progress_value >= total_iterations:
@@ -819,24 +980,28 @@ class SeperateVR(SeperateAttributes):
                     self.set_progress_bar(0.1, 0.8/total_iterations*self.progress_value)
                     X_batch = X_dataset[i: i + self.batch_size]
                     X_batch = torch.from_numpy(X_batch).to(device)
-                    pred = model.predict_mask(X_batch)
+                    pred = self.model_run.predict_mask(X_batch)
+                    if not pred.size()[3] > 0:
+                        raise Exception(ERROR_MAPPER[WINDOW_SIZE_ERROR])
                     pred = pred.detach().cpu().numpy()
                     pred = np.concatenate(pred, axis=2)
                     mask.append(pred)
-                    
+                if len(mask) == 0:
+                    raise Exception(ERROR_MAPPER[WINDOW_SIZE_ERROR])
+                
                 mask = np.concatenate(mask, axis=2)
-
             return mask
-        
-        def postprocess(mask, X_mag, X_phase, aggressiveness):
-            
-            if self.primary_stem == VOCAL_STEM:
-                mask = (1.0 - spec_utils.adjust_aggr(mask, True, aggressiveness))
-            else:   
-                mask = spec_utils.adjust_aggr(mask, False, aggressiveness)
+
+        def postprocess(mask, X_mag, X_phase):
+            is_non_accom_stem = False
+            for stem in NON_ACCOM_STEMS:
+                if stem == self.primary_stem:
+                    is_non_accom_stem = True
+                    
+            mask = spec_utils.adjust_aggr(mask, is_non_accom_stem, aggressiveness)
 
             if self.is_post_process:
-                mask = spec_utils.merge_artifacts(mask)
+                mask = spec_utils.merge_artifacts(mask, thres=self.post_process_threshold)
 
             y_spec = mask * X_mag * np.exp(1.j * X_phase)
             v_spec = (1 - mask) * X_mag * np.exp(1.j * X_phase)
@@ -845,7 +1010,7 @@ class SeperateVR(SeperateAttributes):
         
         X_mag, X_phase = spec_utils.preprocess(X_spec)
         n_frame = X_mag.shape[2]
-        pad_l, pad_r, roi_size = spec_utils.make_padding(n_frame, self.crop_size, model.offset)
+        pad_l, pad_r, roi_size = spec_utils.make_padding(n_frame, self.window_size, self.model_run.offset)
         X_mag_pad = np.pad(X_mag, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
         X_mag_pad /= X_mag_pad.max()
         mask = _execute(X_mag_pad, roi_size)
@@ -861,7 +1026,7 @@ class SeperateVR(SeperateAttributes):
         else:
             mask = mask[:, :, :n_frame]
 
-        y_spec, v_spec = postprocess(mask, X_mag, X_phase, aggressiveness)
+        y_spec, v_spec = postprocess(mask, X_mag, X_phase)
         
         return y_spec, v_spec
 
@@ -884,7 +1049,10 @@ def process_secondary_model(secondary_model: ModelData, process_data, main_model
     if secondary_model.process_method == VR_ARCH_TYPE:
         seperator = SeperateVR(secondary_model, process_data, main_model_primary_stem_4_stem=main_model_primary_stem_4_stem, main_process_method=main_process_method)
     if secondary_model.process_method == MDX_ARCH_TYPE:
-        seperator = SeperateMDX(secondary_model, process_data, main_model_primary_stem_4_stem=main_model_primary_stem_4_stem, main_process_method=main_process_method)
+        if secondary_model.is_mdx_c:
+            seperator = SeperateMDXC(secondary_model, process_data, main_model_primary_stem_4_stem=main_model_primary_stem_4_stem, main_process_method=main_process_method)
+        else:
+            seperator = SeperateMDX(secondary_model, process_data, main_model_primary_stem_4_stem=main_model_primary_stem_4_stem, main_process_method=main_process_method)
     if secondary_model.process_method == DEMUCS_ARCH_TYPE:
         seperator = SeperateDemucs(secondary_model, process_data, main_model_primary_stem_4_stem=main_model_primary_stem_4_stem, main_process_method=main_process_method)
         
@@ -908,13 +1076,13 @@ def gather_sources(primary_stem_name, secondary_stem_name, secondary_sources: di
 
     return source_primary, source_secondary
         
-def prepare_mix(mix, chunk_set, margin_set, mdx_net_cut=False, is_missing_mix=False):
-
+def prepare_mix(mix):
+    
     audio_path = mix
-    samplerate = 44100
 
     if not isinstance(mix, np.ndarray):
-        mix, samplerate = librosa.load(mix, mono=False, sr=44100)
+        mix, sr = librosa.load(mix, mono=False, sr=44100)
+  
     else:
         mix = mix.T
 
@@ -924,43 +1092,7 @@ def prepare_mix(mix, chunk_set, margin_set, mdx_net_cut=False, is_missing_mix=Fa
     if mix.ndim == 1:
         mix = np.asfortranarray([mix,mix])
 
-    try:
-        print(f'{os.path.basename(audio_path)} Input Shape: ', mix.shape)
-    except:
-        print('Missing Shape')
-
-    def get_segmented_mix(chunk_set=chunk_set):
-        segmented_mix = {}
-        
-        samples = mix.shape[-1]
-        margin = margin_set
-        chunk_size = chunk_set*44100
-        assert not margin == 0, 'margin cannot be zero!'
-        if margin > chunk_size:
-            margin = chunk_size
-        if chunk_set == 0 or samples < chunk_size:
-            chunk_size = samples
-        
-        counter = -1
-        for skip in range(0, samples, chunk_size):
-            counter+=1
-            s_margin = 0 if counter == 0 else margin
-            end = min(skip+chunk_size+margin, samples)
-            start = skip-s_margin
-            segmented_mix[skip] = mix[:,start:end].copy()
-            if end == samples:
-                break
-            
-        return segmented_mix
-
-    if is_missing_mix:
-        return mix
-    else:
-        segmented_mix = get_segmented_mix()
-        raw_mix = get_segmented_mix(chunk_set=0) if mdx_net_cut else mix
-        # segmented_mix = mix
-        # raw_mix = mix
-        return segmented_mix, raw_mix, samplerate
+    return mix
 
 def rerun_mp3(audio_file, sample_rate=44100):
 
@@ -991,3 +1123,15 @@ def save_format(audio_path, save_format, mp3_bit_set):
             os.remove(audio_path)
         except Exception as e:
             print(e)
+            
+def pitch_shift(mix):
+    new_sr = 31183
+
+    # Resample audio file
+    resampled_audio = signal.resample_poly(mix, new_sr, 44100)
+    
+    return resampled_audio
+
+def list_to_dictionary(lst):
+    dictionary = {item: index for index, item in enumerate(lst)}
+    return dictionary
