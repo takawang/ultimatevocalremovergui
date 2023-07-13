@@ -10,7 +10,7 @@ from lib_v5.tfc_tdf_v3 import TFC_TDF_net, STFT
 from lib_v5 import spec_utils
 from lib_v5.vr_network import nets
 from lib_v5.vr_network import nets_new
-#from lib_v5.vr_network.model_param_init import ModelParameters
+from lib_v5.vr_network.model_param_init import ModelParameters
 from pathlib import Path
 from gui_data.constants import *
 from gui_data.error_handling import *
@@ -29,6 +29,8 @@ import soundfile as sf
 import traceback
 import lib_v5.mdxnet as MdxnetSet
 import math
+#import random
+from tqdm import tqdm
 from onnx import load
 from onnx2pytorch import ConvertModel
 
@@ -85,9 +87,11 @@ class SeperateAttributes:
         self.is_ensemble_mode = model_data.is_ensemble_mode
         self.secondary_model = model_data.secondary_model #
         self.primary_model_primary_stem = model_data.primary_model_primary_stem
+        self.primary_stem_native = model_data.primary_stem_native
         self.primary_stem = model_data.primary_stem #
         self.secondary_stem = model_data.secondary_stem #
         self.is_invert_spec = model_data.is_invert_spec #
+        self.is_deverb_vocals = model_data.is_deverb_vocals
         self.is_mixer_mode = model_data.is_mixer_mode #
         self.secondary_model_scale = model_data.secondary_model_scale #
         self.is_demucs_pre_proc_model_inst_mix = model_data.is_demucs_pre_proc_model_inst_mix #
@@ -100,6 +104,7 @@ class SeperateAttributes:
         self.main_model_primary_stem_4_stem = main_model_primary_stem_4_stem
         self.ensemble_primary_stem = model_data.ensemble_primary_stem
         self.is_gpu = False
+        self.is_deverb = True
 
         if not model_data.process_method == DEMUCS_ARCH_TYPE:
             self.check_label_secondary_stem_runs()
@@ -257,13 +262,16 @@ class SeperateAttributes:
             if self.process_method == DEMUCS_ARCH_TYPE:
                 self.cached_model_source_holder(DEMUCS_ARCH_TYPE, secondary_sources, self.model_basename)
                 
-    def write_audio(self, stem_path, stem_source, samplerate, secondary_model_source=None, model_scale=None):
+    def write_audio(self, stem_path, stem_source, samplerate, secondary_model_source=None, model_scale=None, stem_name=None):
                 
         if not self.is_secondary_model:
             if self.is_secondary_model_activated:
                 if isinstance(secondary_model_source, np.ndarray):
                     secondary_model_scale = model_scale if model_scale else self.secondary_model_scale
                     stem_source = spec_utils.average_dual_sources(stem_source, secondary_model_source, secondary_model_scale)
+            
+            if stem_name == VOCAL_STEM and self.is_deverb_vocals:
+                stem_source = vr_denoiser(stem_source, self.device, is_deverber=True)
             
             sf.write(stem_path, stem_source, samplerate, subtype=self.wav_type_set)
             save_format(stem_path, self.save_format, self.mp3_bit_set) if not self.is_ensemble_mode else None
@@ -347,16 +355,16 @@ class SeperateMDX(SeperateAttributes):
             self.write_to_console(f'{SAVING_STEM[0]}{self.primary_stem}{SAVING_STEM[1]}') if not self.is_secondary_model else None
             primary_stem_path = os.path.join(self.export_path, f'{self.audio_file_base}_({self.primary_stem}).wav')
             if not isinstance(self.primary_source, np.ndarray):
-                self.primary_source = spec_utils.normalize(source*self.compensate, self.is_normalization).T
+                self.primary_source = spec_utils.normalize(source, self.is_normalization).T
             self.primary_source_map = {self.primary_stem: self.primary_source}
-            self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary)
+            self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary, stem_name=self.primary_stem)
 
         if not self.is_primary_stem_only:
             self.write_to_console(f'{SAVING_STEM[0]}{self.secondary_stem}{SAVING_STEM[1]}') if not self.is_secondary_model else None
             secondary_stem_path = os.path.join(self.export_path, f'{self.audio_file_base}_({self.secondary_stem}).wav')
             if not isinstance(self.secondary_source, np.ndarray):
                 raw_mix = self.demix(self.match_frequency_pitch(mix), is_match_mix=True) if mdx_net_cut else self.match_frequency_pitch(mix)
-                self.secondary_source, raw_mix = spec_utils.normalize_two_stem(source*self.compensate, raw_mix, self.is_normalization)
+                self.secondary_source, raw_mix = spec_utils.normalize_two_stem(source, raw_mix, self.is_normalization)
             
                 if self.is_invert_spec:
                     self.secondary_source = spec_utils.invert_stem(raw_mix, self.secondary_source)
@@ -365,7 +373,7 @@ class SeperateMDX(SeperateAttributes):
                     self.secondary_source = (-self.secondary_source.T+raw_mix.T)
 
             self.secondary_source_map = {self.secondary_stem: self.secondary_source}
-            self.write_audio(secondary_stem_path, self.secondary_source, samplerate, self.secondary_source_secondary)
+            self.write_audio(secondary_stem_path, self.secondary_source, samplerate, self.secondary_source_secondary, stem_name=self.secondary_stem)
 
         torch.cuda.empty_cache()
         secondary_sources = {**self.primary_source_map, **self.secondary_source_map}
@@ -420,13 +428,12 @@ class SeperateMDX(SeperateAttributes):
                 window = np.hanning(chunk_size_actual)
                 window = np.tile(window[None, None, :], (1, 2, 1))
 
+            mix_part_ = mixture[:, start:end]
             if end != i + chunk_size:
                 pad_size = (i + chunk_size) - end
-                mix_part = [np.concatenate((mixture[:, start:end], np.zeros((2, pad_size), dtype='float32')), axis=-1)]
-            else:
-                mix_part = [mixture[:, start:end]]
+                mix_part_ = np.concatenate((mix_part_, np.zeros((2, pad_size), dtype='float32')), axis=-1)
 
-            mix_part = torch.tensor(mix_part, dtype=torch.float32).to(self.device)
+            mix_part = torch.tensor([mix_part_], dtype=torch.float32).to(self.device)
             mix_waves = mix_part.split(self.mdx_batch_size)
 
             with torch.no_grad():
@@ -454,6 +461,14 @@ class SeperateMDX(SeperateAttributes):
         if self.is_pitch_change and not is_match_mix:
             source = self.pitch_fix(source, sr_pitched, org_mix)
 
+        source = source if is_match_mix else source*self.compensate
+
+        if self.is_denoise and not is_match_mix:
+            if NO_STEM in self.primary_stem_native or self.primary_stem_native == INST_STEM:
+                source = org_mix - vr_denoiser(org_mix-source, self.device)
+            else:
+                source = vr_denoiser(source, self.device)
+
         return source
 
     def run_model(self, mix, is_match_mix=False):
@@ -465,8 +480,10 @@ class SeperateMDX(SeperateAttributes):
             spec_pred = spek.cpu().numpy()
         else:
             spec_pred = -self.model_run(-spek)*0.5+self.model_run(spek)*0.5 if self.is_denoise else self.model_run(spek)
+            #spec_pred = spek.cpu().numpy() - spec_pred*self.compensate
 
         return self.stft.inverse(torch.tensor(spec_pred).to(self.device)).cpu().detach().numpy()
+
 
 class SeperateMDXC(SeperateAttributes):        
 
@@ -502,7 +519,7 @@ class SeperateMDXC(SeperateAttributes):
                 primary_stem_path = os.path.join(self.export_path, f'{self.audio_file_base}_({stem}).wav')
                 self.primary_source = spec_utils.normalize(sources[stem], self.is_normalization).T
                 self.primary_source_map = {self.primary_stem: self.primary_source}
-                self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary)
+                self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary, stem_name=stem)
         else:
             source_primary = sources if len(stem_list) == 1 else sources[self.mdxnet_stem_select]
 
@@ -513,7 +530,7 @@ class SeperateMDXC(SeperateAttributes):
                     self.primary_source = spec_utils.normalize(source_primary, self.is_normalization).T
 
                 self.primary_source_map = {self.primary_stem: self.primary_source}
-                self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary)
+                self.write_audio(primary_stem_path, self.primary_source, samplerate, self.secondary_source_primary, stem_name=self.primary_stem)
 
             if not self.is_primary_stem_only:
                 self.write_to_console(f'{SAVING_STEM[0]}{self.secondary_stem}{SAVING_STEM[1]}') if not self.is_secondary_model else None
@@ -542,7 +559,7 @@ class SeperateMDXC(SeperateAttributes):
                             self.secondary_source = (-self.secondary_source.T+raw_mix.T)
                             
                 self.secondary_source_map = {self.secondary_stem: self.secondary_source}
-                self.write_audio(secondary_stem_path, self.secondary_source, samplerate, self.secondary_source_secondary)
+                self.write_audio(secondary_stem_path, self.secondary_source, samplerate, self.secondary_source_secondary, stem_name=self.secondary_stem)
 
         torch.cuda.empty_cache()
         secondary_sources = {**self.primary_source_map, **self.secondary_source_map}
@@ -560,7 +577,6 @@ class SeperateMDXC(SeperateAttributes):
         
         model = TFC_TDF_net(self.mdx_c_configs).eval().to(self.device)
         model.load_state_dict(torch.load(self.model_path, map_location=self.device))
-        
         mix = torch.tensor(mix, dtype=torch.float32)
 
         try:
@@ -596,26 +612,32 @@ class SeperateMDXC(SeperateAttributes):
         X = torch.zeros(S, 2, C - H) if S > 1 else torch.zeros(2, C - H)
         X = X.to(self.device)
 
-        with torch.cuda.amp.autocast():
-            with torch.no_grad():
-                for batch in batches:
-                    self.running_inference_progress_bar(len(batches))
-                    x = model(batch)
-                    for w in x:
-                        a = X[..., :-(C - H)]
-                        b = X[..., -(C - H):] + w[..., :(C - H)]
-                        c = w[..., (C - H):]
-                        X = torch.cat([a, b, c], -1)
+        #with torch.cuda.amp.autocast():
+        with torch.no_grad():
+            for batch in batches:
+                self.running_inference_progress_bar(len(batches))
+                x = model(batch)
+                for w in x:
+                    a = X[..., :-(C - H)]
+                    b = X[..., -(C - H):] + w[..., :(C - H)]
+                    c = w[..., (C - H):]
+                    X = torch.cat([a, b, c], -1)
 
         estimated_sources = X[..., C - H:-(pad_size + C - H)] / N
-
 
         pitch_fix = lambda s:self.pitch_fix(s, sr_pitched, org_mix)
 
         if S > 1:
-            return {k: pitch_fix(v) if self.is_pitch_change else v for k, v in zip(self.mdx_c_configs.training.instruments, estimated_sources.cpu().numpy())}
+            sources = {k: pitch_fix(v) if self.is_pitch_change else v for k, v in zip(self.mdx_c_configs.training.instruments, estimated_sources.cpu().detach().numpy())}
+            
+            if self.is_denoise:
+                if VOCAL_STEM in sources.keys() and INST_STEM in sources.keys():
+                    sources[VOCAL_STEM] = vr_denoiser(sources[VOCAL_STEM], self.device)
+                    sources[INST_STEM] = org_mix - sources[VOCAL_STEM]
+                            
+            return sources
         else:
-            est_s = estimated_sources.cpu().numpy()
+            est_s = estimated_sources.cpu().detach().numpy()
             return pitch_fix(est_s) if self.is_pitch_change else est_s
 
 class SeperateDemucs(SeperateAttributes):        
@@ -871,7 +893,10 @@ class SeperateVR(SeperateAttributes):
             nn_arch_size = min(nn_arch_sizes, key=lambda x:abs(x-model_size))
 
             if nn_arch_size in vr_5_1_models or self.is_vr_51_model:
-                self.model_run = nets_new.CascadedNet(self.mp.param['bins'] * 2, nn_arch_size, nout=self.model_capacity[0], nout_lstm=self.model_capacity[1])
+                self.model_run = nets_new.CascadedNet(self.mp.param['bins'] * 2, 
+                                                      nn_arch_size, 
+                                                      nout=self.model_capacity[0], 
+                                                      nout_lstm=self.model_capacity[1])
                 print('51')
             else:
                 self.model_run = nets.determine_model_capacity(self.mp.param['bins'] * 2, nn_arch_size)
@@ -1135,3 +1160,125 @@ def pitch_shift(mix):
 def list_to_dictionary(lst):
     dictionary = {item: index for index, item in enumerate(lst)}
     return dictionary
+
+def vr_denoiser(X, device, hop_length=1024, n_fft=2048, cropsize=256, is_deverber=False):
+    batchsize = 4
+
+    denoiser_loc = os.path.join("lib_v5", "denoiser_lite.pth")
+    deverber = os.path.join("lib_v5", "deverber.pth")
+    
+    utl_model = deverber if is_deverber else denoiser_loc
+    
+    if is_deverber:
+        nout, nout_lstm = 64, 128
+        mp = ModelParameters(os.path.join('lib_v5', 'vr_network', 'modelparams', '4band_v3.json'))
+        n_fft = mp.param['bins'] * 2
+    else:
+        mp = None
+        hop_length=1024
+        nout, nout_lstm = 16, 128
+    
+    model = nets_new.CascadedNet(n_fft, nout=nout, nout_lstm=nout_lstm)
+    model.load_state_dict(torch.load(utl_model, map_location=device))
+    model.to(device)
+
+    if mp is None:
+        X_spec = spec_utils.wave_to_spectrogram(X, hop_length, n_fft)
+    else:
+        X_spec = loading_mix(X.T, mp)
+   
+    #PreProcess
+    X_mag = np.abs(X_spec)
+    X_phase = np.angle(X_spec)
+
+    #Sep
+    n_frame = X_mag.shape[2]
+    pad_l, pad_r, roi_size = spec_utils.make_padding(n_frame, cropsize, model.offset)
+    X_mag_pad = np.pad(X_mag, ((0, 0), (0, 0), (pad_l, pad_r)), mode='constant')
+    X_mag_pad /= X_mag_pad.max()
+
+    X_dataset = []
+    patches = (X_mag_pad.shape[2] - 2 * model.offset) // roi_size
+    for i in range(patches):
+        start = i * roi_size
+        X_mag_crop = X_mag_pad[:, :, start:start + cropsize]
+        X_dataset.append(X_mag_crop)
+
+    X_dataset = np.asarray(X_dataset)
+
+    model.eval()
+    
+    with torch.no_grad():
+        mask = []
+        # To reduce the overhead, dataloader is not used.
+        for i in tqdm(range(0, patches, batchsize)):
+            X_batch = X_dataset[i: i + batchsize]
+            X_batch = torch.from_numpy(X_batch).to(device)
+
+            pred = model.predict_mask(X_batch)
+
+            pred = pred.detach().cpu().numpy()
+            pred = np.concatenate(pred, axis=2)
+            mask.append(pred)
+
+        mask = np.concatenate(mask, axis=2)
+    
+    mask = mask[:, :, :n_frame]
+
+    #Post Proc
+    if is_deverber:
+        v_spec = mask * X_mag * np.exp(1.j * X_phase)
+    else:
+        v_spec = (1 - mask) * X_mag * np.exp(1.j * X_phase)
+
+    if mp is None:
+        wave = spec_utils.spectrogram_to_wave_old(v_spec, hop_length=1024)
+        wave = spec_utils.match_array_shapes(wave, X)
+    else:
+        wave = spec_utils.cmb_spectrogram_to_wave(v_spec, mp).T
+
+    return wave
+
+
+def loading_mix(X, mp):
+
+    X_wave, X_spec_s = {}, {}
+    
+    bands_n = len(mp.param['band'])
+    
+    for d in range(bands_n, 0, -1):        
+        bp = mp.param['band'][d]
+    
+        if OPERATING_SYSTEM == 'Darwin':
+            wav_resolution = 'polyphase' if SYSTEM_PROC == ARM or ARM in SYSTEM_ARCH else bp['res_type']
+        else:
+            wav_resolution = 'polyphase'#bp['res_type']
+    
+        if d == bands_n: # high-end band
+            X_wave[d] = X
+
+        else: # lower bands
+            X_wave[d] = librosa.resample(X_wave[d+1], mp.param['band'][d+1]['sr'], bp['sr'], res_type=wav_resolution)
+            
+        X_spec_s[d] = spec_utils.wave_to_spectrogram_mt(X_wave[d], bp['hl'], bp['n_fft'], mp.param['mid_side'], 
+                                                        mp.param['mid_side_b2'], mp.param['reverse'])
+        
+        # if d == bands_n and is_high_end_process:
+        #     input_high_end_h = (bp['n_fft']//2 - bp['crop_stop']) + (mp.param['pre_filter_stop'] - mp.param['pre_filter_start'])
+        #     input_high_end = X_spec_s[d][:, bp['n_fft']//2-input_high_end_h:bp['n_fft']//2, :]
+
+    X_spec = spec_utils.combine_spectrograms(X_spec_s, mp)
+    
+    del X_wave, X_spec_s
+
+    return X_spec
+
+# def spec_to_wav(spec, is_high_end_process=False):
+    
+#     if is_high_end_process:        
+#         input_high_end_ = spec_utils.mirroring('mirroring', spec, input_high_end, mp)
+#         wav = spec_utils.cmb_spectrogram_to_wave(spec, mp, input_high_end_h, input_high_end_)       
+#     else:
+#         wav = spec_utils.cmb_spectrogram_to_wave(spec, mp)
+        
+#     return wav

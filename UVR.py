@@ -277,7 +277,8 @@ class ModelData():
         self.wav_type_set = root.wav_type_set
         self.mp3_bit_set = root.mp3_bit_set_var.get()
         self.save_format = root.save_format_var.get()
-        self.is_invert_spec = root.is_invert_spec_var.get()
+        self.is_invert_spec = root.is_invert_spec_var.get()#
+        self.is_deverb_vocals = root.is_deverb_vocals_var.get()#
         self.is_mixer_mode = root.is_mixer_mode_var.get()
         self.demucs_stems = root.demucs_stems_var.get()
         self.is_demucs_combine_stems = root.is_demucs_combine_stems_var.get()
@@ -289,6 +290,7 @@ class ModelData():
         self.model_status = False if self.model_name == CHOOSE_MODEL or self.model_name == NO_MODEL else True
         self.primary_stem = None
         self.secondary_stem = None
+        self.primary_stem_native = None
         self.is_ensemble_mode = False
         self.ensemble_primary_stem = None
         self.ensemble_secondary_stem = None
@@ -359,8 +361,10 @@ class ModelData():
                     vr_model_param = os.path.join(VR_PARAM_DIR, "{}.json".format(self.model_data["vr_model_param"]))
                     self.primary_stem = self.model_data["primary_stem"]
                     self.secondary_stem = secondary_stem(self.primary_stem)
+                    #print(vr_model_param)
                     self.vr_model_param = ModelParameters(vr_model_param)
                     self.model_samplerate = self.vr_model_param.param['sr']
+                    self.primary_stem_native = self.primary_stem
                     if "nout" in self.model_data.keys() and "nout_lstm" in self.model_data.keys():
                         self.model_capacity = self.model_data["nout"], self.model_data["nout_lstm"]
                         self.is_vr_51_model = True
@@ -390,9 +394,11 @@ class ModelData():
                             if self.mdx_c_configs.training.target_instrument:
                                 self.mdx_model_stems = [self.mdx_c_configs.training.target_instrument] 
                                 self.primary_stem = self.mdx_c_configs.training.target_instrument
+                                self.primary_stem_native = self.primary_stem
                             else:
                                 self.mdx_model_stems = self.mdx_c_configs.training.instruments
                                 self.primary_stem = PRIMARY_STEM if self.is_ensemble_mode else self.mdxnet_stem_select
+                                self.primary_stem_native = self.primary_stem
                                 self.mdxnet_stem_select = self.ensemble_primary_stem if self.is_ensemble_mode else self.mdxnet_stem_select
                                 self.mdx_stem_count = len(self.mdx_model_stems)
                         else:
@@ -403,6 +409,7 @@ class ModelData():
                         self.mdx_dim_t_set = self.model_data["mdx_dim_t_set"]
                         self.mdx_n_fft_scale_set = self.model_data["mdx_n_fft_scale_set"]
                         self.primary_stem = self.model_data["primary_stem"]
+                        self.primary_stem_native = self.model_data["primary_stem"]
                         
                     self.secondary_stem = secondary_stem(self.primary_stem)
                 else:
@@ -2722,7 +2729,7 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
 
         mdx_opt_title = self.menu_title_LABEL_SET(mdx_net_frame, "Advanced MDX-Net Options")
         mdx_opt_title.grid(pady=10)
-            
+        
         compensate_Label = self.menu_sub_LABEL_SET(mdx_net_frame, 'Volume Compensation')
         compensate_Label.grid(pady=4)
         compensate_Option = ttk.Combobox(mdx_net_frame, value=VOL_COMPENSATION, width=MENU_COMBOBOX_WIDTH, textvariable=self.compensate_var)
@@ -2780,6 +2787,10 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         is_invert_spec_Option = ttk.Checkbutton(mdx_net_frame, text='Spectral Inversion', width=MDX_CHECKBOXS_WIDTH, variable=self.is_invert_spec_var) 
         is_invert_spec_Option.grid(pady=0)
         self.help_hints(is_invert_spec_Option, text=IS_INVERT_SPEC_HELP)
+
+        is_deverb_vocals_Option = ttk.Checkbutton(mdx_net_frame, text='Deverb Vocals', width=MDX_CHECKBOXS_WIDTH, variable=self.is_deverb_vocals_var) 
+        is_deverb_vocals_Option.grid(pady=0)
+        self.help_hints(is_deverb_vocals_Option, text=IS_DEVERB_VOC_HELP)
 
         clear_mdx_cache_Button = ttk.Button(mdx_net_frame, text='Clear Auto-Set Cache', command=lambda:self.clear_cache(MDX_ARCH_TYPE))
         clear_mdx_cache_Button.grid(pady=5)
@@ -5196,7 +5207,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
         self.is_denoise_var = tk.BooleanVar(value=data['is_denoise'])#is_match_frequency_pitch
         self.is_match_frequency_pitch_var = tk.BooleanVar(value=data['is_match_frequency_pitch'])#
         self.is_mdx_c_seg_def_var = tk.BooleanVar(value=data['is_mdx_c_seg_def'])#
-        self.is_invert_spec_var = tk.BooleanVar(value=data['is_invert_spec'])
+        self.is_invert_spec_var = tk.BooleanVar(value=data['is_invert_spec'])#
+        self.is_deverb_vocals_var = tk.BooleanVar(value=data['is_deverb_vocals'])#
         self.is_mixer_mode_var = tk.BooleanVar(value=data['is_mixer_mode'])
         self.mdx_batch_size_var = tk.StringVar(value=data['mdx_batch_size'])
         self.mdx_voc_inst_secondary_model_var = tk.StringVar(value=data['mdx_voc_inst_secondary_model'])
@@ -5318,7 +5330,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             self.overlap_mdx_var.set(loaded_setting['overlap_mdx'])
             self.overlap_mdx23_var.set(loaded_setting['overlap_mdx23'])
             self.is_mdx_c_seg_def_var.set(loaded_setting['is_mdx_c_seg_def'])#
-            self.is_invert_spec_var.set(loaded_setting['is_invert_spec'])
+            self.is_invert_spec_var.set(loaded_setting['is_invert_spec'])#
+            self.is_deverb_vocals_var.set(loaded_setting['is_deverb_vocals'])#
             self.is_mixer_mode_var.set(loaded_setting['is_mixer_mode'])
             self.mdx_batch_size_var.set(loaded_setting['mdx_batch_size'])
             self.mdx_voc_inst_secondary_model_var.set(loaded_setting['mdx_voc_inst_secondary_model'])
@@ -5419,7 +5432,8 @@ class MainWindow(TkinterDnD.Tk if is_dnd_compatible else tk.Tk):
             'is_denoise': self.is_denoise_var.get(),#is_match_frequency_pitch
             'is_match_frequency_pitch': self.is_match_frequency_pitch_var.get(),#is_match_frequency_pitch
             'is_mdx_c_seg_def': self.is_mdx_c_seg_def_var.get(),#
-            'is_invert_spec': self.is_invert_spec_var.get(),
+            'is_invert_spec': self.is_invert_spec_var.get(),#
+            'is_deverb_vocals': self.is_deverb_vocals_var.get(),#
             'is_mixer_mode': self.is_mixer_mode_var.get(),
             'mdx_batch_size':self.mdx_batch_size_var.get(),
             'mdx_voc_inst_secondary_model': self.mdx_voc_inst_secondary_model_var.get(),
